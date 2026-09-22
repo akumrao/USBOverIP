@@ -8,6 +8,7 @@
 // 3. System and Hardware APIs
 #include <cfgmgr32.h>
 #include <devguid.h>
+#include <iomanip>
 #include <iostream>
 #include <setupapi.h>
 #include <string>
@@ -20,6 +21,7 @@
 
 #define USBIP_PORT "3240"
 #define USBIP_VERSION 0x0111
+#define REG_BOUND_PATH L"SOFTWARE\\USBOverIP\\BoundDevices"
 
 #pragma pack(push, 1)
 struct usbip_header {
@@ -83,17 +85,78 @@ std::string WideToString(const std::wstring &wstr) {
   if (wstr.empty())
     return "";
 
-  // Pass wstr.c_str() to extract the inner const wchar_t* pointer
   int size = WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), (int)wstr.size(),
                                  NULL, 0, NULL, NULL);
   std::string str(size, 0);
 
-  // Pass the pointer to the underlying buffer using &str[0]
   WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), (int)wstr.size(), &str[0], size,
                       NULL, NULL);
   return str;
 }
 
+// Check if a specific BUSID is recorded as bound in the registry
+bool IsDeviceBound(const std::string &busId) {
+  HKEY hKey;
+  if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, REG_BOUND_PATH, 0, KEY_READ, &hKey) !=
+      ERROR_SUCCESS) {
+    return false;
+  }
+  std::wstring wBusId(busId.begin(), busId.end());
+  DWORD val = 0;
+  DWORD size = sizeof(val);
+  LONG result =
+      RegQueryValueExW(hKey, wBusId.c_str(), NULL, NULL, (LPBYTE)&val, &size);
+  RegCloseKey(hKey);
+  return (result == ERROR_SUCCESS);
+}
+
+void ExecuteBind(const std::string &busId) {
+  HKEY hKey;
+  LONG result =
+      RegCreateKeyExW(HKEY_LOCAL_MACHINE, REG_BOUND_PATH, 0, NULL,
+                      REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hKey, NULL);
+  if (result != ERROR_SUCCESS) {
+    std::cerr
+        << "Error: Failed to access registry. Please run as Administrator."
+        << std::endl;
+    return;
+  }
+
+  std::wstring wBusId(busId.begin(), busId.end());
+  DWORD val = 1;
+  result = RegSetValueExW(hKey, wBusId.c_str(), 0, REG_DWORD,
+                          (const BYTE *)&val, sizeof(val));
+  RegCloseKey(hKey);
+
+  if (result == ERROR_SUCCESS) {
+    std::cout << "info: bind successful for busid " << busId << std::endl;
+  } else {
+    std::cerr << "Error: Could not save binding configuration for " << busId
+              << std::endl;
+  }
+}
+
+void ExecuteUnbind(const std::string &busId) {
+  HKEY hKey;
+  LONG result =
+      RegOpenKeyExW(HKEY_LOCAL_MACHINE, REG_BOUND_PATH, 0, KEY_WRITE, &hKey);
+  if (result != ERROR_SUCCESS) {
+    std::cerr << "Error: No bound devices found or run as Administrator."
+              << std::endl;
+    return;
+  }
+
+  std::wstring wBusId(busId.begin(), busId.end());
+  result = RegDeleteValueW(hKey, wBusId.c_str());
+  RegCloseKey(hKey);
+
+  if (result == ERROR_SUCCESS) {
+    std::cout << "info: unbind successful for busid " << busId << std::endl;
+  } else {
+    std::cerr << "Error: Busid " << busId << " was not found in the bound list."
+              << std::endl;
+  }
+}
 
 void ExecuteDeviceListing() {
   HDEVINFO devInfo =
@@ -107,18 +170,16 @@ void ExecuteDeviceListing() {
   SP_DEVINFO_DATA devInfoData;
   devInfoData.cbSize = sizeof(SP_DEVINFO_DATA);
 
-  std::cout << "\n============================================================="
-               "===========\n";
-  std::cout << "BUS ID\tBOUND\tDRIVER\t\tDEVICE DESCRIPTION\n";
-  std::cout << "==============================================================="
-               "=========\n";
+  std::cout << "Connected:" << std::endl;
+  std::cout << std::left << std::setw(8) << "BUSID" << std::setw(11)
+            << "VID:PID" << std::setw(30) << "DEVICE"
+            << "STATE" << std::endl;
 
   for (DWORD i = 0; SetupDiEnumDeviceInfo(devInfo, i, &devInfoData); i++) {
     wchar_t buffer[MAX_DEVICE_ID_LEN] = {0};
-    std::string description = "Unknown USB Device";
-    std::string serviceName = "None";
+    std::string description = "USB Input Device";
     std::string busId = "1-1";
-    bool isBound = false;
+    std::string vidPid = "0000:0000";
 
     if (SetupDiGetDeviceRegistryPropertyW(devInfo, &devInfoData,
                                           SPDRP_DEVICEDESC, NULL, (PBYTE)buffer,
@@ -126,18 +187,22 @@ void ExecuteDeviceListing() {
       description = WideToString(buffer);
     }
 
-    if (SetupDiGetDeviceRegistryPropertyW(devInfo, &devInfoData, SPDRP_SERVICE,
-                                          NULL, (PBYTE)buffer, sizeof(buffer),
-                                          NULL)) {
-      serviceName = WideToString(buffer);
-      if (serviceName == "VBoxUSB") {
-        isBound = true;
-      }
-    }
-
     if (CM_Get_Device_IDW(devInfoData.DevInst, buffer, MAX_DEVICE_ID_LEN, 0) ==
         CR_SUCCESS) {
       std::wstring wInstanceId(buffer);
+
+      size_t vidPos = wInstanceId.find(L"VID_");
+      size_t pidPos = wInstanceId.find(L"PID_");
+      if (vidPos != std::wstring::npos && pidPos != std::wstring::npos &&
+          wInstanceId.length() >= vidPos + 8 &&
+          wInstanceId.length() >= pidPos + 8) {
+        std::wstring wVid = wInstanceId.substr(vidPos + 4, 4);
+        std::wstring wPid = wInstanceId.substr(pidPos + 4, 4);
+        vidPid = WideToString(wVid) + ":" + WideToString(wPid);
+        for (auto &c : vidPid)
+          c = (char)tolower(c);
+      }
+
       size_t slashIndex = wInstanceId.find_last_of(L"\\");
       if (slashIndex != std::wstring::npos) {
         std::wstring wBusId = wInstanceId.substr(slashIndex + 1, 5);
@@ -145,16 +210,17 @@ void ExecuteDeviceListing() {
       }
     }
 
-    if (serviceName.length() < 8)
-      serviceName += "\t";
+    bool isShared = IsDeviceBound(busId);
 
-    std::cout << busId << "\t" << (isBound ? "Yes" : "No") << "\t"
-              << serviceName << "\t" << description << std::endl;
+    std::cout << std::left << std::setw(8) << busId << std::setw(11) << vidPid
+              << std::setw(30) << description
+              << (isShared ? "Shared" : "Not shared") << std::endl;
   }
 
-  std::cout << "==============================================================="
-               "=========\n"
-            << std::endl;
+  std::cout << "\nPersisted:" << std::endl;
+  std::cout << std::left << std::setw(38) << "GUID"
+            << "DEVICE" << std::endl;
+
   SetupDiDestroyDeviceInfoList(devInfo);
 }
 
@@ -268,9 +334,33 @@ int main(int argc, char *argv[]) {
     if (argument == "--list" || argument == "-l") {
       ExecuteDeviceListing();
       return 0;
+    } else if (argument == "--bind" || argument == "-b") {
+      if (argc > 2) {
+        ExecuteBind(argv[2]);
+        return 0;
+      } else {
+        std::cerr
+            << "Error: --bind requires a BUSID argument (e.g., --bind 1-5)"
+            << std::endl;
+        return 1;
+      }
+    } else if (argument == "--unbind" || argument == "-u") {
+      if (argc > 2) {
+        ExecuteUnbind(argv[2]);
+        return 0;
+      } else {
+        std::cerr
+            << "Error: --unbind requires a BUSID argument (e.g., --unbind 1-5)"
+            << std::endl;
+        return 1;
+      }
     } else {
-      std::cout << "Unknown option: " << argument
-                << "\nUsage: usbip_server.exe [--list]" << std::endl;
+      std::cout << "Unknown option: " << argument << "\n\n"
+                << "Usage:\n"
+                << "  usbip_server.exe --list\n"
+                << "  usbip_server.exe --bind <BUSID>\n"
+                << "  usbip_server.exe --unbind <BUSID>\n"
+                << std::endl;
       return 1;
     }
   }
