@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WebRTC Firestore Signaler</title>
+    <style>
+        body { font-family: -apple-system, sans-serif; padding: 20px; max-width: 600px; margin: 0 auto; background: #f9f9f9; }
+        .card { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); margin-bottom: 20px; }
+        button { background: #0070f3; color: white; border: none; padding: 10px 15px; border-radius: 5px; cursor: pointer; font-size: 14px; margin-right: 10px; }
+        button:hover { background: #0051cb; }
+        button:disabled { background: #b2bec3; cursor: not-allowed; }
+        input { padding: 8px; width: 60%; border: 1px solid #ccc; border-radius: 5px; margin-right: 10px; }
+        #status { font-weight: bold; color: #d63031; margin-top: 15px; }
+        #chatBox { height: 150px; border: 1px solid #dfe6e9; border-radius: 5px; padding: 10px; overflow-y: auto; background: #fafafa; margin-bottom: 10px; font-size: 14px; }
+        .msg { margin-bottom: 5px; }
+        .remote-msg { color: #0070f3; font-weight: bold; }
+        .local-msg { color: #2d3436; }
+    </style>
+</head>
+<body>
+
+    <h2>WebRTC Async Signaler (Data Channel Chat)</h2>
+    
+    <div class="card">
+        <h3>1. Create a Call Room (Caller Role)</h3>
+        <button id="createBtn">Create Room</button>
+        <p>Your Generated Room ID: <strong id="roomIdDisplay" style="color:#0070f3;">-</strong></p>
+    </div>
+
+    <div class="card">
+        <h3>2. Join an Existing Room (Callee Role)</h3>
+        <input type="text" id="roomInput" placeholder="Paste Room ID here">
+        <button id="joinBtn">Join Room</button>
+    </div>
+
+    <div class="card">
+        <h3>3. Data Channel Real-time Chat</h3>
+        <div id="chatBox"></div>
+        <input type="text" id="chatInput" placeholder="Type a message here..." disabled>
+        <button id="sendBtn" disabled>Send Message</button>
+    </div>
+
+    <div class="card">
+        <h3>System Logs</h3>
+        <div id="status">Status: Disconnected. Choose a role above.</div>
+    </div>
+
+    <!-- Main JavaScript modular logic link -->
+    <script type="module" src="app.js"></script>
+</body>
+</html>

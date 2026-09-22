@@ -1,0 +1,12 @@
+[requires]
+openssl/3.6.2
+google-webrtc/136
+firebase-cpp-sdk/13.12.0
+spdlog/1.17.0
+
+[generators]
+CMakeDeps
+CMakeToolchain
+
+[layout]
+cmake_layout
