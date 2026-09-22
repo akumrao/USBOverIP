@@ -10,6 +10,8 @@
 #include <devguid.h>
 #include <iomanip>
 #include <iostream>
+#include <mutex>
+#include <set>
 #include <setupapi.h>
 #include <string>
 #include <thread>
@@ -22,6 +24,24 @@
 #define USBIP_PORT "3240"
 #define USBIP_VERSION 0x0111
 #define REG_BOUND_PATH L"SOFTWARE\\USBOverIP\\BoundDevices"
+
+// Track active client attachments globally across threads
+std::mutex g_stateMutex;
+std::set<std::string> g_attachedDevices;
+
+void SetDeviceAttached(const std::string &busId, bool attached) {
+  std::lock_guard<std::mutex> lock(g_stateMutex);
+  if (attached) {
+    g_attachedDevices.insert(busId);
+  } else {
+    g_attachedDevices.erase(busId);
+  }
+}
+
+bool IsDeviceAttached(const std::string &busId) {
+  std::lock_guard<std::mutex> lock(g_stateMutex);
+  return g_attachedDevices.find(busId) != g_attachedDevices.end();
+}
 
 #pragma pack(push, 1)
 struct usbip_header {
@@ -94,7 +114,6 @@ std::string WideToString(const std::wstring &wstr) {
   return str;
 }
 
-// Check if a specific BUSID is recorded as bound in the registry
 bool IsDeviceBound(const std::string &busId) {
   HKEY hKey;
   if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, REG_BOUND_PATH, 0, KEY_READ, &hKey) !=
@@ -158,6 +177,36 @@ void ExecuteUnbind(const std::string &busId) {
   }
 }
 
+void ExecuteUnbindAll() {
+  HKEY hKey;
+  LONG result = RegOpenKeyExW(HKEY_LOCAL_MACHINE, REG_BOUND_PATH, 0,
+                              KEY_READ | KEY_WRITE, &hKey);
+  if (result != ERROR_SUCCESS) {
+    std::cerr << "Error: No bound devices found or run as Administrator."
+              << std::endl;
+    return;
+  }
+
+  wchar_t valueName[256];
+  DWORD valueNameSize = 256;
+  std::vector<std::wstring> valuesToDelete;
+
+  DWORD i = 0;
+  while (RegEnumValueW(hKey, i, valueName, &valueNameSize, NULL, NULL, NULL,
+                       NULL) == ERROR_SUCCESS) {
+    valuesToDelete.push_back(valueName);
+    i++;
+    valueNameSize = 256;
+  }
+
+  for (const auto &val : valuesToDelete) {
+    RegDeleteValueW(hKey, val.c_str());
+  }
+
+  RegCloseKey(hKey);
+  std::cout << "info: unbind all successful, all devices unbound." << std::endl;
+}
+
 void ExecuteDeviceListing() {
   HDEVINFO devInfo =
       SetupDiGetClassDevsW(&GUID_DEVCLASS_USB, NULL, NULL, DIGCF_PRESENT);
@@ -210,11 +259,15 @@ void ExecuteDeviceListing() {
       }
     }
 
-    bool isShared = IsDeviceBound(busId);
+    std::string state = "Not shared";
+    if (IsDeviceAttached(busId)) {
+      state = "Attached";
+    } else if (IsDeviceBound(busId)) {
+      state = "Shared";
+    }
 
     std::cout << std::left << std::setw(8) << busId << std::setw(11) << vidPid
-              << std::setw(30) << description
-              << (isShared ? "Shared" : "Not shared") << std::endl;
+              << std::setw(30) << description << state << std::endl;
   }
 
   std::cout << "\nPersisted:" << std::endl;
@@ -237,7 +290,8 @@ bool PopulateImportDetails(const std::string &targetBusId,
   return true;
 }
 
-void MaintainDataTunnel(SOCKET clientSocket) {
+void MaintainDataTunnel(SOCKET clientSocket, const std::string &targetBusId) {
+  SetDeviceAttached(targetBusId, true);
   while (true) {
     usbip_header_basic commonPrefix;
     if (recv(clientSocket, (char *)&commonPrefix, sizeof(usbip_header_basic),
@@ -270,6 +324,7 @@ void MaintainDataTunnel(SOCKET clientSocket) {
         send(clientSocket, transferPayload.data(), bufferLen, 0);
     }
   }
+  SetDeviceAttached(targetBusId, false);
   closesocket(clientSocket);
 }
 
@@ -291,10 +346,17 @@ void ExecuteProtocolEngine(SOCKET clientSocket) {
   } else if (parsedCmd == 0x8003) {
     char requestedId[32] = {0};
     recv(clientSocket, requestedId, 32, MSG_WAITALL);
+
+    std::string targetBusId(requestedId);
+    size_t nullPos = targetBusId.find('\0');
+    if (nullPos != std::string::npos) {
+      targetBusId = targetBusId.substr(0, nullPos);
+    }
+
     op_rep_import mappingResponse{};
-    if (PopulateImportDetails(requestedId, mappingResponse)) {
+    if (PopulateImportDetails(targetBusId, mappingResponse)) {
       send(clientSocket, (char *)&mappingResponse, sizeof(op_rep_import), 0);
-      MaintainDataTunnel(clientSocket);
+      MaintainDataTunnel(clientSocket, targetBusId);
     } else {
       closesocket(clientSocket);
     }
@@ -339,27 +401,33 @@ int main(int argc, char *argv[]) {
         ExecuteBind(argv[2]);
         return 0;
       } else {
-        std::cerr
-            << "Error: --bind requires a BUSID argument (e.g., --bind 1-5)"
-            << std::endl;
+        std::cerr << "Error: --bind requires a BUSID argument." << std::endl;
         return 1;
       }
     } else if (argument == "--unbind" || argument == "-u") {
       if (argc > 2) {
-        ExecuteUnbind(argv[2]);
+        std::string subArg = argv[2];
+        if (subArg == "all") {
+          ExecuteUnbindAll();
+        } else {
+          ExecuteUnbind(subArg);
+        }
         return 0;
       } else {
-        std::cerr
-            << "Error: --unbind requires a BUSID argument (e.g., --unbind 1-5)"
-            << std::endl;
+        std::cerr << "Error: --unbind requires a BUSID or 'all' argument."
+                  << std::endl;
         return 1;
       }
+    } else if (argument == "--unbind-all") {
+      ExecuteUnbindAll();
+      return 0;
     } else {
       std::cout << "Unknown option: " << argument << "\n\n"
                 << "Usage:\n"
                 << "  usbip_server.exe --list\n"
                 << "  usbip_server.exe --bind <BUSID>\n"
                 << "  usbip_server.exe --unbind <BUSID>\n"
+                << "  usbip_server.exe --unbind all (or --unbind-all)\n"
                 << std::endl;
       return 1;
     }
