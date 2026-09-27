@@ -1,7 +1,7 @@
 #define WIN32_LEAN_AND_MEAN
-#include <windows.h>
-#include <winsock2.h>
+#include <winsock2.h> // Must be included BEFORE windows.h to avoid definition conflicts
 #include <ws2tcpip.h>
+#include <windows.h>
 #include <winioctl.h>
 #include <cstdint>
 #include <cstdio>
@@ -335,18 +335,20 @@ int main(int argc, char* argv[]) {
     } 
     else if (command == "detach" || command == "-d") {
         uint32_t portNum = 0;
+        bool portFound = false;
         for (int i = 2; i < argc; ++i) {
             std::string arg = argv[i];
             if ((arg == "-p" || arg == "--port") && i + 1 < argc) {
                 try {
                     portNum = std::stoul(argv[i + 1]);
+                    portFound = true;
                 } catch (...) {
-                    portNum = 0;
+                    portFound = false;
                 }
             }
         }
-        if (portNum == 0) {
-            std::cerr << "Error: 'detach' requires a valid non-zero port specification (-p <port>)." << std::endl;
+        if (!portFound) {
+            std::cerr << "Error: 'detach' requires a valid port switch specification (-p <port>)." << std::endl;
             return 1;
         }
         ExecuteDetach(portNum);
