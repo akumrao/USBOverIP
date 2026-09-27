@@ -1,14 +1,14 @@
 #define WIN32_LEAN_AND_MEAN
-#include 
-#include 
-#include 
-#include 
-#include 
-#include 
-#include 
-#include 
-#include 
-#include 
+#include <windows.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <winioctl.h>
+#include <cstdint>
+#include <cstdio>
+#include <iostream>
+#include <iomanip>
+#include <string>
+#include <vector>
 
 #pragma comment(lib, "ws2_32.lib")
 
@@ -91,13 +91,30 @@ struct USBIP_DETACH_REQUEST {
 };
 #pragma pack(pop)
 
-SOCKET ConnectToServer(const std::string& host) {
-    WSADATA wsaData;
-    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
-        std::cerr << "Error: WSAStartup failed." << std::endl;
-        return INVALID_SOCKET;
+// RAII Guard for WSA Initialization
+struct WinsockScope {
+    bool ok = false;
+    WinsockScope() {
+        WSADATA wsaData;
+        ok = (WSAStartup(MAKEWORD(2, 2), &wsaData) == 0);
     }
+    ~WinsockScope() {
+        if (ok) WSACleanup();
+    }
+};
 
+// Reliable exact-byte network read wrapper
+bool RecvAll(SOCKET sock, char* buffer, size_t length) {
+    size_t totalReceived = 0;
+    while (totalReceived < length) {
+        int bytes = recv(sock, buffer + totalReceived, static_cast<int>(length - totalReceived), 0);
+        if (bytes <= 0) return false;
+        totalReceived += bytes;
+    }
+    return true;
+}
+
+SOCKET ConnectToServer(const std::string& host) {
     struct addrinfo hints{}, *res = nullptr;
     hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_STREAM;
@@ -105,7 +122,6 @@ SOCKET ConnectToServer(const std::string& host) {
 
     if (getaddrinfo(host.c_str(), USBIP_PORT, &hints, &res) != 0) {
         std::cerr << "Error: Failed to resolve hostname/IP: " << host << std::endl;
-        WSACleanup();
         return INVALID_SOCKET;
     }
 
@@ -113,15 +129,13 @@ SOCKET ConnectToServer(const std::string& host) {
     if (sock == INVALID_SOCKET) {
         std::cerr << "Error: Failed to create socket." << std::endl;
         freeaddrinfo(res);
-        WSACleanup();
         return INVALID_SOCKET;
     }
 
-    if (connect(sock, res->ai_addr, (int)res->ai_addrlen) == SOCKET_ERROR) {
+    if (connect(sock, res->ai_addr, static_cast<int>(res->ai_addrlen)) == SOCKET_ERROR) {
         std::cerr << "Error: Failed to connect to server " << host << ":" << USBIP_PORT << std::endl;
         closesocket(sock);
         freeaddrinfo(res);
-        WSACleanup();
         return INVALID_SOCKET;
     }
 
@@ -138,18 +152,22 @@ void ExecuteRemoteList(const std::string& host) {
     req.header.command = htons(0x8005);
     req.header.status = 0;
 
-    if (send(sock, (char*)&req, sizeof(req), 0) == SOCKET_ERROR) {
+    if (send(sock, reinterpret_cast<char*>(&req), sizeof(req), 0) == SOCKET_ERROR) {
         std::cerr << "Error: Failed to send device list request." << std::endl;
         closesocket(sock);
-        WSACleanup();
         return;
     }
 
     op_rep_devlist rep{};
-    if (recv(sock, (char*)&rep, sizeof(rep), MSG_WAITALL) <= 0) {
+    if (!RecvAll(sock, reinterpret_cast<char*>(&rep), sizeof(rep))) {
         std::cerr << "Error: Failed to receive device list response." << std::endl;
         closesocket(sock);
-        WSACleanup();
+        return;
+    }
+
+    if (ntohl(rep.header.status) != 0) {
+        std::cerr << "Error: Remote server returned error status code " << ntohl(rep.header.status) << std::endl;
+        closesocket(sock);
         return;
     }
 
@@ -159,7 +177,10 @@ void ExecuteRemoteList(const std::string& host) {
 
     for (uint32_t i = 0; i < numDevices; ++i) {
         op_dev_export dev{};
-        if (recv(sock, (char*)&dev, sizeof(dev), MSG_WAITALL) <= 0) break;
+        if (!RecvAll(sock, reinterpret_cast<char*>(&dev), sizeof(dev))) {
+            std::cerr << "Error: Device list stream interrupted prematurely." << std::endl;
+            break;
+        }
 
         char vidPidBuf[16];
         snprintf(vidPidBuf, sizeof(vidPidBuf), "%04X:%04X", ntohs(dev.idVendor), ntohs(dev.idProduct));
@@ -170,12 +191,11 @@ void ExecuteRemoteList(const std::string& host) {
 
         for (uint8_t intf = 0; intf < dev.bNumInterfaces; ++intf) {
             uint32_t intfData[2];
-            recv(sock, (char*)&intfData, sizeof(intfData), MSG_WAITALL);
+            if (!RecvAll(sock, reinterpret_cast<char*>(&intfData), sizeof(intfData))) break;
         }
     }
 
     closesocket(sock);
-    WSACleanup();
 }
 
 void ExecuteAttach(const std::string& host, const std::string& busId) {
@@ -190,13 +210,13 @@ void ExecuteAttach(const std::string& host, const std::string& busId) {
     );
 
     if (hDriver == INVALID_HANDLE_VALUE) {
-        std::cerr << "Error: Failed to open kernel driver handle. Ensure usbip-win2 drivers are installed and running." << std::endl;
+        std::cerr << "Error: Failed to open kernel driver handle. Ensure usbip-win2 drivers are installed." << std::endl;
         return;
     }
 
     USBIP_ATTACH_REQUEST attachReq{};
-    strcpy_s(attachReq.Host, host.c_str());
-    strcpy_s(attachReq.BusId, busId.c_str());
+    strcpy_s(attachReq.Host, sizeof(attachReq.Host), host.c_str());
+    strcpy_s(attachReq.BusId, sizeof(attachReq.BusId), busId.c_str());
     attachReq.Port = 0;
 
     DWORD bytesReturned = 0;
@@ -264,15 +284,21 @@ void ExecuteDetach(uint32_t portNum) {
 void PrintUsage() {
     std::cout << "USBIP Command-Line Client (Full Driver Integration)\n\n"
               << "Usage:\n"
-              << "  usbip_client.exe list -r \n"
-              << "  usbip_client.exe attach -r  -b \n"
-              << "  usbip_client.exe detach -p \n"
+              << "  usbip_client.exe list -r <host>\n"
+              << "  usbip_client.exe attach -r <host> -b <busid>\n"
+              << "  usbip_client.exe detach -p <port>\n"
               << std::endl;
 }
 
 int main(int argc, char* argv[]) {
     if (argc < 2) {
         PrintUsage();
+        return 1;
+    }
+
+    WinsockScope wsGuard;
+    if (!wsGuard.ok) {
+        std::cerr << "Error: WSAStartup failed to initialize Winsock." << std::endl;
         return 1;
     }
 
@@ -286,7 +312,7 @@ int main(int argc, char* argv[]) {
             }
         }
         if (serverIP.empty()) {
-            std::cerr << "Error: 'list' requires a remote server flag (-r )." << std::endl;
+            std::cerr << "Error: 'list' requires a remote server flag (-r <host>)." << std::endl;
             return 1;
         }
         ExecuteRemoteList(serverIP);
@@ -312,11 +338,15 @@ int main(int argc, char* argv[]) {
         for (int i = 2; i < argc; ++i) {
             std::string arg = argv[i];
             if ((arg == "-p" || arg == "--port") && i + 1 < argc) {
-                portNum = std::stoul(argv[i + 1]);
+                try {
+                    portNum = std::stoul(argv[i + 1]);
+                } catch (...) {
+                    portNum = 0;
+                }
             }
         }
         if (portNum == 0) {
-            std::cerr << "Error: 'detach' requires a port specification (-p )." << std::endl;
+            std::cerr << "Error: 'detach' requires a valid non-zero port specification (-p <port>)." << std::endl;
             return 1;
         }
         ExecuteDetach(portNum);
