@@ -1,9 +1,6 @@
 #include "usbipd.h"
+#include "vbox_usb.h"
 #include <iostream>
-#include <newdev.h>
-
-DEFINE_GUID(GUID_DEVINTERFACE_USB_DEVICE, 0xA5DCBF10, 0x6530, 0x11D2, 0x90,
-            0x1F, 0x00, 0xC0, 0x4F, 0xB9, 0x51, 0xED);
 
 bool ReceiveExactBytes(SOCKET s, char *buffer, int bytesToRead) {
   int totalRead = 0;
@@ -16,131 +13,29 @@ bool ReceiveExactBytes(SOCKET s, char *buffer, int bytesToRead) {
   return true;
 }
 
-bool BindWinUSBToDevice(const std::wstring &hardwareId,
-                        const std::wstring &infPath) {
-  BOOL rebootRequired = FALSE;
-  std::cout << "[+] Swapping driver to WinUSB for "
-            << std::string(hardwareId.begin(), hardwareId.end()) << "..."
-            << std::endl;
-  std::cout << "[*] Using INF Path: "
-            << std::string(infPath.begin(), infPath.end()) << std::endl;
+// Opens a direct connection to VirtualBox's Kernel Driver
+HANDLE OpenVBoxUsbDriver() {
+  HANDLE hVBox =
+      CreateFileW(VBOXUSB_DEVICE_NAME, GENERIC_READ | GENERIC_WRITE,
+                  FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
+                  FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED, NULL);
 
-  BOOL success = UpdateDriverForPlugAndPlayDevicesW(
-      NULL, hardwareId.c_str(), infPath.c_str(),
-      INSTALLFLAG_FORCE | INSTALLFLAG_READONLY, &rebootRequired);
-
-  if (!success) {
-    DWORD err = GetLastError();
-    std::cerr << "[-] Driver Swap Failed! Win32 Error Code: " << err << " (0x"
-              << std::hex << err << ")" << std::endl;
-    if (err == 0x800F022F || err == 2) {
-      std::cerr << "    -> Cause: INF file not found or invalid format."
-                << std::endl;
-    } else if (err == 0x800F0203) {
-      std::cerr << "    -> Cause: Hardware ID in INF does not match the "
-                   "connected USB device."
-                << std::endl;
-    } else if (err == 0x80070005) {
-      std::cerr
-          << "    -> Cause: Access Denied. Must run server as Administrator."
-          << std::endl;
-    }
-  } else {
-    std::cout << "[+] Driver Swap Succeeded!" << std::endl;
-  }
-
-  return (success == TRUE);
+  return hVBox;
 }
 
-// Opens WinUSB interface handle to route live physical USB traffic
-//HANDLE OpenPhysicalWinUSBDevice(WINUSB_INTERFACE_HANDLE *phWinUsb) {
-//  HDEVINFO hDevInfo =
-//      SetupDiGetClassDevsW(&GUID_DEVINTERFACE_USB_DEVICE, NULL, NULL,
-//                           DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
-//  if (hDevInfo == INVALID_HANDLE_VALUE)
-//    return INVALID_HANDLE_VALUE;
-//
-//  SP_DEVICE_INTERFACE_DATA interfaceData = {sizeof(SP_DEVICE_INTERFACE_DATA)};
-//  DWORD index = 0;
-//  HANDLE hDevice = INVALID_HANDLE_VALUE;
-//
-//  while (SetupDiEnumDeviceInterfaces(
-//      hDevInfo, NULL, &GUID_DEVINTERFACE_USB_DEVICE, index++, &interfaceData)) {
-//    DWORD detailSize = 0;
-//    SetupDiGetDeviceInterfaceDetailW(hDevInfo, &interfaceData, NULL, 0,
-//                                     &detailSize, NULL);
-//
-//    std::vector<char> buffer(detailSize);
-//    PSP_DEVICE_INTERFACE_DETAIL_DATA_W pDetail =
-//        (PSP_DEVICE_INTERFACE_DETAIL_DATA_W)buffer.data();
-//    pDetail->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W);
-//
-//    if (SetupDiGetDeviceInterfaceDetailW(hDevInfo, &interfaceData, pDetail,
-//                                         detailSize, NULL, NULL)) {
-//      hDevice = CreateFileW(pDetail->DevicePath, GENERIC_READ | GENERIC_WRITE,
-//                            FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
-//                            OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
-//      if (hDevice != INVALID_HANDLE_VALUE) {
-//        if (WinUsb_Initialize(hDevice, phWinUsb)) {
-//          SetupDiDestroyDeviceInfoList(hDevInfo);
-//          return hDevice;
-//        }
-//        CloseHandle(hDevice);
-//      }
-//    }
-//  }
-//
-//  SetupDiDestroyDeviceInfoList(hDevInfo);
-//  return INVALID_HANDLE_VALUE;
-//}
+// Intercepts and captures physical device via VBoxUSBMon.sys
+bool CaptureDeviceWithVBox(HANDLE hVBox, uint16_t vid, uint16_t pid) {
+  VBOXUSB_CAPTURE_REQ req = {0};
+  req.vendorId = vid;
+  req.productId = pid;
+  req.busNumber = 1;
+  req.deviceAddress = 2;
 
-// 2. Update OpenPhysicalWinUSBDevice() with polling retries:
-HANDLE OpenPhysicalWinUSBDevice(WINUSB_INTERFACE_HANDLE *phWinUsb) {
-  // Retry up to 5 times to account for PnP startup latency
-  for (int retry = 0; retry < 5; ++retry) {
-    HDEVINFO hDevInfo =
-        SetupDiGetClassDevsW(&GUID_DEVINTERFACE_USB_DEVICE, NULL, NULL,
-                             DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
-    if (hDevInfo == INVALID_HANDLE_VALUE) {
-      Sleep(500);
-      continue;
-    }
+  DWORD bytesReturned = 0;
+  BOOL result = DeviceIoControl(hVBox, VBOXUSB_IOCTL_CAPTURE_DEVICE, &req,
+                                sizeof(req), NULL, 0, &bytesReturned, NULL);
 
-    SP_DEVICE_INTERFACE_DATA interfaceData = {sizeof(SP_DEVICE_INTERFACE_DATA)};
-    DWORD index = 0;
-
-    while (SetupDiEnumDeviceInterfaces(hDevInfo, NULL,
-                                       &GUID_DEVINTERFACE_USB_DEVICE, index++,
-                                       &interfaceData)) {
-      DWORD detailSize = 0;
-      SetupDiGetDeviceInterfaceDetailW(hDevInfo, &interfaceData, NULL, 0,
-                                       &detailSize, NULL);
-
-      std::vector<char> buffer(detailSize);
-      PSP_DEVICE_INTERFACE_DETAIL_DATA_W pDetail =
-          (PSP_DEVICE_INTERFACE_DETAIL_DATA_W)buffer.data();
-      pDetail->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W);
-
-      if (SetupDiGetDeviceInterfaceDetailW(hDevInfo, &interfaceData, pDetail,
-                                           detailSize, NULL, NULL)) {
-        HANDLE hDevice =
-            CreateFileW(pDetail->DevicePath, GENERIC_READ | GENERIC_WRITE,
-                        FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
-                        FILE_FLAG_OVERLAPPED, NULL);
-        if (hDevice != INVALID_HANDLE_VALUE) {
-          if (WinUsb_Initialize(hDevice, phWinUsb)) {
-            SetupDiDestroyDeviceInfoList(hDevInfo);
-            return hDevice; // Successfully opened WinUSB handle
-          }
-          CloseHandle(hDevice);
-        }
-      }
-    }
-    SetupDiDestroyDeviceInfoList(hDevInfo);
-    Sleep(500); // Wait before attempting next retry
-  }
-
-  return INVALID_HANDLE_VALUE;
+  return (result == TRUE);
 }
 
 std::vector<USBIP_DEVICE_DESC> ScanPhysicalUsbBus() {
@@ -198,29 +93,29 @@ void ConnectionWorkerThread(SOCKET clientSocket) {
       return;
     }
 
-    // Force driver swap to WinUSB on host machine
-    wchar_t exePath[MAX_PATH];
-    GetModuleFileNameW(NULL, exePath, MAX_PATH);
-    std::wstring infPath(exePath);
-    infPath = infPath.substr(0, infPath.find_last_of(L"\\/")) + L"\\winusb.inf";
-
-    BindWinUSBToDevice(L"USB\\VID_0781&PID_5590", infPath);
-
-    Sleep(1000);
-
-    // Initialize Physical WinUSB Handle
-    WINUSB_INTERFACE_HANDLE hWinUsb = NULL;
-    HANDLE hDevice = OpenPhysicalWinUSBDevice(&hWinUsb);
-
-    if (hDevice == INVALID_HANDLE_VALUE) {
-      std::cerr
-          << "[-] Error: Failed to open WinUSB handle to physical USB device."
-          << std::endl;
+    // Connect to VBoxUSBMon.sys Kernel Handle
+    HANDLE hVBox = OpenVBoxUsbDriver();
+    if (hVBox == INVALID_HANDLE_VALUE) {
+      std::cerr << "[-] Error: VBoxUSBMon.sys driver not found. Ensure "
+                   "VirtualBox is installed!"
+                << std::endl;
       closesocket(clientSocket);
       return;
     }
 
-    std::cout << "[+] Physical USB Hardware Bridge Engaged!" << std::endl;
+    // Capture target hardware VID/PID using VirtualBox kernel IOCTL
+    if (!CaptureDeviceWithVBox(hVBox, 0x0781, 0x5590)) {
+      std::cerr
+          << "[-] Error: VBoxUSBMon failed to capture target physical hardware."
+          << std::endl;
+      CloseHandle(hVBox);
+      closesocket(clientSocket);
+      return;
+    }
+
+    std::cout << "[+] Physical Hardware successfully captured via "
+                 "VBoxUSBMon.sys Kernel Driver!"
+              << std::endl;
 
     USBIP_OP_REP_IMPORT importReply = {0};
     importReply.common.version = SWAP16(0x0111);
@@ -238,7 +133,7 @@ void ConnectionWorkerThread(SOCKET clientSocket) {
 
     send(clientSocket, (char *)&importReply, sizeof(USBIP_OP_REP_IMPORT), 0);
 
-    // Dynamic Hardware Streaming Loop
+    // Streaming Loop: Bridge USB/IP commands directly to VBoxUSBMon
     while (true) {
       USBIP_HEADER_BASIC basicHeader;
       if (!ReceiveExactBytes(clientSocket, (char *)&basicHeader,
@@ -266,34 +161,35 @@ void ConnectionWorkerThread(SOCKET clientSocket) {
 
         std::vector<char> dataBuffer(reqLen > 0 ? reqLen : 0);
 
-        // Host-to-Device Payload
-        if (direction == 0 && reqLen > 0) {
+        if (direction == 0 && reqLen > 0) { // OUT Transfer
           if (!ReceiveExactBytes(clientSocket, dataBuffer.data(), reqLen))
             break;
         }
 
-        ULONG bytesTransferred = 0;
+        // Construct VirtualBox Kernel URB Request Packet
+        std::vector<char> ioctlBuffer(sizeof(VBOXUSB_URB_HDR) +
+                                      (reqLen > 0 ? reqLen : 0));
+        VBOXUSB_URB_HDR *pVBoxUrb = (VBOXUSB_URB_HDR *)ioctlBuffer.data();
+        pVBoxUrb->handle = 1;
+        pVBoxUrb->endpoint = (direction == 1) ? (0x80 | ep) : ep;
+        pVBoxUrb->transferFlags = direction;
+        pVBoxUrb->bufferLength = reqLen;
 
-        // Route Control Endpoint (EP0) directly to hardware
-        if (ep == 0) {
-          WINUSB_SETUP_PACKET setupPacket;
-          memcpy(&setupPacket, tail.setup, 8);
-
-          WinUsb_ControlTransfer(hWinUsb, setupPacket,
-                                 (PUCHAR)dataBuffer.data(), reqLen,
-                                 &bytesTransferred, NULL);
+        if (direction == 0 && reqLen > 0) {
+          memcpy(ioctlBuffer.data() + sizeof(VBOXUSB_URB_HDR),
+                 dataBuffer.data(), reqLen);
         }
-        // Route Bulk Endpoints (EP1, EP2, etc.) directly to hardware
-        else {
-          UCHAR pipeID = (direction == 1) ? (0x80 | (UCHAR)ep) : (UCHAR)ep;
 
-          if (direction == 1) { // Bulk IN Read
-            WinUsb_ReadPipe(hWinUsb, pipeID, (PUCHAR)dataBuffer.data(), reqLen,
-                            &bytesTransferred, NULL);
-          } else { // Bulk OUT Write
-            WinUsb_WritePipe(hWinUsb, pipeID, (PUCHAR)dataBuffer.data(), reqLen,
-                             &bytesTransferred, NULL);
-          }
+        DWORD bytesReturned = 0;
+        // Dispatch URB directly to VBoxUSBMon kernel stack
+        BOOL ioctlSuccess =
+            DeviceIoControl(hVBox, VBOXUSB_IOCTL_SUBMIT_URB, ioctlBuffer.data(),
+                            (DWORD)ioctlBuffer.size(), ioctlBuffer.data(),
+                            (DWORD)ioctlBuffer.size(), &bytesReturned, NULL);
+
+        int32_t actualTransferred = 0;
+        if (ioctlSuccess && bytesReturned >= sizeof(VBOXUSB_URB_HDR)) {
+          actualTransferred = pVBoxUrb->bufferLength;
         }
 
         USBIP_RET_SUBMIT retSubmit = {0};
@@ -303,11 +199,12 @@ void ConnectionWorkerThread(SOCKET clientSocket) {
         retSubmit.base.direction = htonl(direction);
         retSubmit.base.ep = basicHeader.ep;
         retSubmit.status = htonl(0);
-        retSubmit.actualLength = htonl((int32_t)bytesTransferred);
+        retSubmit.actualLength = htonl(actualTransferred);
 
         send(clientSocket, (char *)&retSubmit, sizeof(USBIP_RET_SUBMIT), 0);
-        if (direction == 1 && bytesTransferred > 0) {
-          send(clientSocket, dataBuffer.data(), (int)bytesTransferred, 0);
+        if (direction == 1 && actualTransferred > 0) {
+          send(clientSocket, ioctlBuffer.data() + sizeof(VBOXUSB_URB_HDR),
+               actualTransferred, 0);
         }
       } else if (cmdType == 0x00000002) { // USBIP_CMD_UNLINK
         char unlinkTail[28];
@@ -324,8 +221,15 @@ void ConnectionWorkerThread(SOCKET clientSocket) {
       }
     }
 
-    WinUsb_Free(hWinUsb);
-    CloseHandle(hDevice);
+    // Release device from VirtualBox Kernel Driver on disconnect
+    VBOXUSB_CAPTURE_REQ releaseReq = {0};
+    releaseReq.vendorId = 0x0781;
+    releaseReq.productId = 0x5590;
+    DWORD dummy = 0;
+    DeviceIoControl(hVBox, VBOXUSB_IOCTL_RELEASE_DEVICE, &releaseReq,
+                    sizeof(releaseReq), NULL, 0, &dummy, NULL);
+
+    CloseHandle(hVBox);
     closesocket(clientSocket);
   } else {
     closesocket(clientSocket);
