@@ -15,7 +15,9 @@
 #define VBOXUSB_IOCTL_SUBMIT_URB VBOXUSB_CTL_CODE(3)
 #define VBOXUSB_IOCTL_REAP_URB VBOXUSB_CTL_CODE(4)
 
-// Standard 8-byte alignment for 64-bit Windows Kernel Drivers
+// Force 1-byte structure boundary alignment matching kernel expectations
+#pragma pack(push, 1)
+
 struct VBOXUSB_CAPTURE_REQ {
   uint32_t vendorId;
   uint32_t productId;
@@ -26,7 +28,6 @@ struct VBOXUSB_CAPTURE_REQ {
   wchar_t devicePath[260]; // Required device instance path
 };
 
-#pragma pack(push, 1)
 struct VBOXUSB_URB_HDR {
   uint32_t handle;
   uint32_t endpoint;
@@ -34,4 +35,5 @@ struct VBOXUSB_URB_HDR {
   uint32_t bufferLength;
   uint32_t status;
 };
+
 #pragma pack(pop)
