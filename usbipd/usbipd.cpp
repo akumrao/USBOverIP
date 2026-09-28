@@ -1,5 +1,6 @@
 #include "usbipd.h"
 #include <iostream>
+#include <vector>
 
 DEFINE_GUID(GUID_DEVCLASS_USB, 0x36fc9e60, 0xc465, 0x11cf, 0x80, 0x56, 0x44,
             0x45, 0x53, 0x54, 0x00, 0x00);
@@ -86,7 +87,7 @@ std::vector<USBIP_DEVICE_DESC> ScanPhysicalUsbBus() {
     strcpy_s(devExchange.busid, "1-1");
     devExchange.busnum = SWAP32(1);
     devExchange.devnum = SWAP32(2);
-    devExchange.speed = SWAP32(3); // USB_SPEED_HIGH
+    devExchange.speed = SWAP32(3); // High speed
     devExchange.idVendor = SWAP16(vid);
     devExchange.idProduct = SWAP16(pid);
     devExchange.bcdDevice = SWAP16(0x0100);
@@ -121,7 +122,6 @@ void ConnectionWorkerThread(SOCKET clientSocket) {
   std::cout << "[*] Parsing Handshake Opcode: 0x" << std::hex
             << evaluatedCommand << std::endl;
 
-  // Handshake 1: Device List Request (OP_REQ_DEVLIST)
   if (evaluatedCommand == 0x8005) {
     std::vector<USBIP_DEVICE_DESC> activeList = ScanPhysicalUsbBus();
 
@@ -140,9 +140,7 @@ void ConnectionWorkerThread(SOCKET clientSocket) {
            0);
     }
     closesocket(clientSocket);
-  }
-  // Handshake 2: Device Import Request (OP_REQ_IMPORT)
-  else if (evaluatedCommand == 0x8003) {
+  } else if (evaluatedCommand == 0x8003) {
     char busidReq[32];
     if (!ReceiveExactBytes(clientSocket, busidReq, sizeof(busidReq))) {
       closesocket(clientSocket);
@@ -172,7 +170,6 @@ void ConnectionWorkerThread(SOCKET clientSocket) {
                  "Bridge open."
               << std::endl;
 
-    // Direct USB/IP Streaming Loop
     while (true) {
       USBIP_HEADER_BASIC basicHeader;
       if (!ReceiveExactBytes(clientSocket, (char *)&basicHeader,
@@ -185,11 +182,9 @@ void ConnectionWorkerThread(SOCKET clientSocket) {
       uint32_t cmdType = ntohl(basicHeader.command);
       uint32_t seqNum = ntohl(basicHeader.seqnum);
       uint32_t direction = ntohl(basicHeader.direction);
+      uint32_t ep = ntohl(basicHeader.ep);
 
-      // Handle USBIP_CMD_SUBMIT (0x00000001)
-      if (cmdType == 0x00000001) {
-        // Read remaining payload after basic header (sizeof USBIP_CMD_SUBMIT -
-        // sizeof USBIP_HEADER_BASIC)
+      if (cmdType == 0x00000001) { // USBIP_CMD_SUBMIT
         struct CMD_SUBMIT_TAIL {
           uint32_t transferFlags;
           int32_t transferBufferLength;
@@ -205,12 +200,11 @@ void ConnectionWorkerThread(SOCKET clientSocket) {
 
         int32_t reqLen = ntohl(tail.transferBufferLength);
 
-        std::cout << "[~] Windows I/O Transaction Stream -> Command: 0x"
-                  << std::hex << cmdType << " | ID Token: " << std::dec
-                  << seqNum << " | Expected Size: " << reqLen << " bytes."
-                  << std::endl;
+        std::cout << "[~] Stream -> Cmd: 0x" << std::hex << cmdType
+                  << " | EP: " << std::dec << ep << " | ID Token: " << seqNum
+                  << " | Expected Size: " << reqLen << " bytes." << std::endl;
 
-        // Receive host payload if OUT transfer (direction == 0)
+        // OUT Transfers (Host -> Device)
         if (direction == 0 && reqLen > 0) {
           std::vector<char> dataBuffer(reqLen);
           if (!ReceiveExactBytes(clientSocket, dataBuffer.data(), reqLen)) {
@@ -219,27 +213,133 @@ void ConnectionWorkerThread(SOCKET clientSocket) {
         }
 
         USBIP_RET_SUBMIT retSubmit = {0};
-        retSubmit.base.command = htonl(0x00000003); // RET_SUBMIT response ID
+        retSubmit.base.command = htonl(0x00000003);
         retSubmit.base.seqnum = htonl(seqNum);
         retSubmit.base.devid = basicHeader.devid;
         retSubmit.base.direction = htonl(direction);
         retSubmit.base.ep = basicHeader.ep;
-        retSubmit.status = htonl(0); // Success status
+        retSubmit.status = htonl(0); // Success
 
-        // Send IN transfer response payload (direction == 1)
+        // IN Transfers (Device -> Host)
         if (direction == 1 && reqLen > 0) {
-          retSubmit.actualLength = htonl(reqLen);
-          send(clientSocket, (char *)&retSubmit, sizeof(USBIP_RET_SUBMIT), 0);
+          std::vector<char> payloadBuffer(reqLen, 0);
 
-          std::vector<char> mockPayload(reqLen, 0);
-          send(clientSocket, mockPayload.data(), reqLen, 0);
+          // Parse EP0 Control Setup Request
+          if (ep == 0) {
+            uint8_t bmRequestType = tail.setup[0];
+            uint8_t bRequest = tail.setup[1];
+            uint8_t descriptorType = tail.setup[3];
+            uint8_t descriptorIndex = tail.setup[2];
+
+            // 0x06 = GET_DESCRIPTOR
+            if (bRequest == 0x06) {
+              // Device Descriptor (0x01)
+              if (descriptorType == 0x01) {
+                USB_DEVICE_DESCRIPTOR devDesc = {0};
+                devDesc.bLength = sizeof(USB_DEVICE_DESCRIPTOR);
+                devDesc.bDescriptorType = 0x01;
+                devDesc.bcdUSB = 0x0200; // USB 2.0
+                devDesc.bDeviceClass = 0x00;
+                devDesc.bDeviceSubClass = 0x00;
+                devDesc.bDeviceProtocol = 0x00;
+                devDesc.bMaxPacketSize0 = 64;
+                devDesc.idVendor = 0x0781;  // SanDisk
+                devDesc.idProduct = 0x5590; // Ultra USB
+                devDesc.bcdDevice = 0x0100;
+                devDesc.iManufacturer = 1;
+                devDesc.iProduct = 2;
+                devDesc.iSerialNumber = 3;
+                devDesc.bNumConfigurations = 1;
+
+                int copyLen = (reqLen < (int)sizeof(devDesc))
+                                  ? reqLen
+                                  : (int)sizeof(devDesc);
+                memcpy(payloadBuffer.data(), &devDesc, copyLen);
+              }
+              // Configuration Descriptor (0x02)
+              else if (descriptorType == 0x02) {
+                USB_FULL_CONFIG_PACKET fullConfig = {0};
+
+                // Config Header
+                fullConfig.config.bLength =
+                    sizeof(USB_CONFIGURATION_DESCRIPTOR);
+                fullConfig.config.bDescriptorType = 0x02;
+                fullConfig.config.wTotalLength = sizeof(USB_FULL_CONFIG_PACKET);
+                fullConfig.config.bNumInterfaces = 1;
+                fullConfig.config.bConfigurationValue = 1;
+                fullConfig.config.iConfiguration = 0;
+                fullConfig.config.bmAttributes = 0x80; // Bus powered
+                fullConfig.config.bMaxPower = 50;      // 100mA
+
+                // Mass Storage Interface
+                fullConfig.interface0.bLength =
+                    sizeof(USB_INTERFACE_DESCRIPTOR);
+                fullConfig.interface0.bDescriptorType = 0x04;
+                fullConfig.interface0.bInterfaceNumber = 0;
+                fullConfig.interface0.bAlternateSetting = 0;
+                fullConfig.interface0.bNumEndpoints = 2;
+                fullConfig.interface0.bInterfaceClass = 0x08; // Mass Storage
+                fullConfig.interface0.bInterfaceSubClass =
+                    0x06; // SCSI Transparent
+                fullConfig.interface0.bInterfaceProtocol = 0x50; // Bulk-Only
+                fullConfig.interface0.iInterface = 0;
+
+                // Bulk IN Endpoint
+                fullConfig.epIn.bLength = sizeof(USB_ENDPOINT_DESCRIPTOR);
+                fullConfig.epIn.bDescriptorType = 0x05;
+                fullConfig.epIn.bEndpointAddress = 0x81; // EP1 IN
+                fullConfig.epIn.bmAttributes = 0x02;     // Bulk
+                fullConfig.epIn.wMaxPacketSize = 512;
+                fullConfig.epIn.bInterval = 0;
+
+                // Bulk OUT Endpoint
+                fullConfig.epOut.bLength = sizeof(USB_ENDPOINT_DESCRIPTOR);
+                fullConfig.epOut.bDescriptorType = 0x05;
+                fullConfig.epOut.bEndpointAddress = 0x01; // EP1 OUT
+                fullConfig.epOut.bmAttributes = 0x02;     // Bulk
+                fullConfig.epOut.wMaxPacketSize = 512;
+                fullConfig.epOut.bInterval = 0;
+
+                int copyLen = (reqLen < (int)sizeof(fullConfig))
+                                  ? reqLen
+                                  : (int)sizeof(fullConfig);
+                memcpy(payloadBuffer.data(), &fullConfig, copyLen);
+              }
+              // String Descriptors (0x03)
+              else if (descriptorType == 0x03) {
+                if (descriptorIndex == 0) { // Supported Languages
+                  uint8_t langDesc[] = {0x04, 0x03, 0x09,
+                                        0x04}; // EN-US (0x0409)
+                  int copyLen = (reqLen < (int)sizeof(langDesc))
+                                    ? reqLen
+                                    : (int)sizeof(langDesc);
+                  memcpy(payloadBuffer.data(), langDesc, copyLen);
+                } else if (descriptorIndex == 1) { // Manufacturer
+                  wchar_t mfgStr[] = L"Virtual USB";
+                  uint8_t len = (uint8_t)(sizeof(mfgStr));
+                  payloadBuffer[0] = len + 2;
+                  payloadBuffer[1] = 0x03;
+                  memcpy(payloadBuffer.data() + 2, mfgStr, len);
+                } else if (descriptorIndex == 2) { // Product
+                  wchar_t prodStr[] = L"Emulated Mass Storage";
+                  uint8_t len = (uint8_t)(sizeof(prodStr));
+                  payloadBuffer[0] = len + 2;
+                  payloadBuffer[1] = 0x03;
+                  memcpy(payloadBuffer.data() + 2, prodStr, len);
+                }
+              }
+            }
+          }
+
+          retSubmit.actualLength = htonl((int32_t)payloadBuffer.size());
+          send(clientSocket, (char *)&retSubmit, sizeof(USBIP_RET_SUBMIT), 0);
+          send(clientSocket, payloadBuffer.data(), (int)payloadBuffer.size(),
+               0);
         } else {
           retSubmit.actualLength = htonl(0);
           send(clientSocket, (char *)&retSubmit, sizeof(USBIP_RET_SUBMIT), 0);
         }
-      }
-      // Handle USBIP_CMD_UNLINK (0x00000002)
-      else if (cmdType == 0x00000002) {
+      } else if (cmdType == 0x00000002) { // USBIP_CMD_UNLINK
         struct CMD_UNLINK_TAIL {
           uint32_t unlinkSeqnum;
           uint8_t padding[24];
@@ -251,14 +351,12 @@ void ConnectionWorkerThread(SOCKET clientSocket) {
         }
 
         USBIP_RET_UNLINK retUnlink = {0};
-        retUnlink.base.command = htonl(0x00000004); // RET_UNLINK response ID
+        retUnlink.base.command = htonl(0x00000004);
         retUnlink.base.seqnum = htonl(seqNum);
-        retUnlink.status = htonl(0); // Success (-ECONNRESET normally)
+        retUnlink.status = htonl(0);
 
         send(clientSocket, (char *)&retUnlink, sizeof(USBIP_RET_UNLINK), 0);
       } else {
-        std::cerr << "[-] Unknown Command Type Received: 0x" << std::hex
-                  << cmdType << std::endl;
         break;
       }
     }
