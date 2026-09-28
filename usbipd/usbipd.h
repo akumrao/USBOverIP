@@ -9,7 +9,6 @@
 #include <vector>
 
 #include <windows.h>
-
 #include <winsock2.h>
 #include <ws2tcpip.h>
 
@@ -17,8 +16,13 @@
 #include <initguid.h>
 #include <setupapi.h>
 
+#ifndef CM_REGKEY_HARDWARE
+#define CM_REGKEY_HARDWARE 0x00000000
+#endif
+
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "setupapi.lib")
+#pragma comment(lib, "cfgmgr32.lib")
 
 #define DIGCF_PRESENT 0x00000002
 #define MAX_DEVICE_ID_LEN 200
@@ -111,10 +115,11 @@ struct USBIP_RET_UNLINK {
 #pragma pack(pop)
 
 bool ReceiveExactBytes(SOCKET s, char *buffer, int bytesToRead);
-bool EnsureVBoxDriverLoaded();
-bool GetUsbBusAndAddress(uint16_t targetVid, uint16_t targetPid,
-                         uint8_t &outBus, uint8_t &outAddress);
-HANDLE OpenVBoxUsbDriver();
-bool CaptureDeviceWithVBox(HANDLE hVBox, uint16_t vid, uint16_t pid);
+bool AttachVBoxFilterToDevice(DEVINST devInst);
+bool GetUsbDeviceNodeAndParams(uint16_t targetVid, uint16_t targetPid,
+                               uint8_t &outBus, uint8_t &outAddress,
+                               DEVINST &outDevInst,
+                               std::wstring &outInstanceId);
+HANDLE OpenVBoxDeviceFilterHandle(uint16_t vid, uint16_t pid);
 std::vector<USBIP_DEVICE_DESC> ScanPhysicalUsbBus();
 void ConnectionWorkerThread(SOCKET clientSocket);

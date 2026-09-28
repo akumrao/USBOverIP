@@ -1,10 +1,7 @@
 #include "usbipd.h"
 #include "vbox_usb.h"
 #include <iostream>
-
-// Standard Windows Device Interface GUID for USB Device enumeration
-DEFINE_GUID(GUID_DEVINTERFACE_USB_DEVICE, 0xA5DCBF10L, 0x6530, 0x11D2, 0x90,
-            0x1F, 0x00, 0xC0, 0x4F, 0xB9, 0x51, 0xED);
+#include <regstr.h>
 
 bool ReceiveExactBytes(SOCKET s, char *buffer, int bytesToRead) {
   int totalRead = 0;
@@ -17,81 +14,93 @@ bool ReceiveExactBytes(SOCKET s, char *buffer, int bytesToRead) {
   return true;
 }
 
-bool EnsureVBoxDriverLoaded() {
-  wchar_t exePath[MAX_PATH];
-  GetModuleFileNameW(NULL, exePath, MAX_PATH);
-  std::wstring dirPath(exePath);
-  dirPath = dirPath.substr(0, dirPath.find_last_of(L"\\/"));
-  std::wstring sysPath = dirPath + L"\\VBoxUSBMon.sys";
-
-  SC_HANDLE hSCM = OpenSCManagerW(NULL, NULL, SC_MANAGER_ALL_ACCESS);
-  if (!hSCM)
+// Injects VBoxUSB into target device UpperFilters safely
+bool AttachVBoxFilterToDevice(DEVINST devInst) {
+  HKEY hKey = NULL;
+  if (CR_SUCCESS != CM_Open_DevNode_Key(devInst, KEY_READ | KEY_WRITE, 0,
+                                        RegDisposition_OpenExisting, &hKey,
+                                        CM_REGKEY_HARDWARE)) {
     return false;
-
-  SC_HANDLE hService = CreateServiceW(
-      hSCM, L"VBoxUSBMon", L"VirtualBox USB Monitor Service",
-      SERVICE_ALL_ACCESS, SERVICE_KERNEL_DRIVER, SERVICE_DEMAND_START,
-      SERVICE_ERROR_NORMAL, sysPath.c_str(), NULL, NULL, NULL, NULL, NULL);
-
-  if (!hService && GetLastError() == ERROR_SERVICE_EXISTS) {
-    hService = OpenServiceW(hSCM, L"VBoxUSBMon", SERVICE_ALL_ACCESS);
   }
 
-  if (hService) {
-    StartServiceW(hService, 0, NULL);
-    CloseServiceHandle(hService);
+  wchar_t currentFilters[1024] = {0};
+  DWORD size = sizeof(currentFilters);
+  DWORD type = REG_MULTI_SZ;
+
+  LONG status = RegQueryValueExW(hKey, L"UpperFilters", NULL, &type,
+                                 (LPBYTE)currentFilters, &size);
+  std::wstring filterList =
+      (status == ERROR_SUCCESS && size > 2)
+          ? std::wstring(currentFilters, size / sizeof(wchar_t))
+          : L"";
+
+  if (filterList.find(L"VBoxUSB") == std::wstring::npos) {
+    std::cout << "[+] Injecting VBoxUSB into target device UpperFilters..."
+              << std::endl;
+
+    wchar_t newFilters[1024] = {0};
+    size_t writeOffset = 0;
+
+    if (status == ERROR_SUCCESS && size > 2) {
+      size_t charCount = (size / sizeof(wchar_t));
+      while (charCount > 0 && currentFilters[charCount - 1] == L'\0') {
+        charCount--;
+      }
+      memcpy(newFilters, currentFilters, charCount * sizeof(wchar_t));
+      writeOffset = charCount;
+      if (writeOffset > 0) {
+        newFilters[writeOffset++] = L'\0';
+      }
+    }
+
+    const wchar_t *targetFilter = L"VBoxUSB";
+    size_t filterLen = wcslen(targetFilter);
+    memcpy(newFilters + writeOffset, targetFilter, filterLen * sizeof(wchar_t));
+    writeOffset += filterLen;
+
+    newFilters[writeOffset++] = L'\0';
+    newFilters[writeOffset++] = L'\0';
+
+    RegSetValueExW(hKey, L"UpperFilters", 0, REG_MULTI_SZ,
+                   (const BYTE *)newFilters,
+                   (DWORD)(writeOffset * sizeof(wchar_t)));
   }
 
-  CloseServiceHandle(hSCM);
-  return true;
+  RegCloseKey(hKey);
+
+  std::cout << "[+] Re-enumerating USB device node to activate filter stack..."
+            << std::endl;
+  CONFIGRET cr = CM_Reenumerate_DevNode(devInst, CM_REENUMERATE_NORMAL);
+  return (cr == CR_SUCCESS);
 }
 
-bool GetUsbBusAndAddress(uint16_t targetVid, uint16_t targetPid,
-                         uint8_t &outBus, uint8_t &outAddress,
-                         std::wstring &outPath) {
-  HDEVINFO hDevInfo =
-      SetupDiGetClassDevsW(&GUID_DEVINTERFACE_USB_DEVICE, nullptr, nullptr,
-                           DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+bool GetUsbDeviceNodeAndParams(uint16_t targetVid, uint16_t targetPid,
+                               uint8_t &outBus, uint8_t &outAddress,
+                               DEVINST &outDevInst,
+                               std::wstring &outInstanceId) {
+  HDEVINFO hDevInfo = SetupDiGetClassDevsW(nullptr, L"USB", nullptr,
+                                           DIGCF_PRESENT | DIGCF_ALLCLASSES);
   if (hDevInfo == INVALID_HANDLE_VALUE)
     return false;
 
-  SP_DEVICE_INTERFACE_DATA interfaceData;
-  interfaceData.cbSize = sizeof(SP_DEVICE_INTERFACE_DATA);
+  SP_DEVINFO_DATA devInfoData;
+  devInfoData.cbSize = sizeof(SP_DEVINFO_DATA);
   DWORD index = 0;
   bool found = false;
 
   wchar_t vidStr[16], pidStr[16];
-  swprintf_s(vidStr, L"vid_%04x", targetVid);
-  swprintf_s(pidStr, L"pid_%04x", targetPid);
+  swprintf_s(vidStr, L"VID_%04X", targetVid);
+  swprintf_s(pidStr, L"PID_%04X", targetPid);
 
-  while (SetupDiEnumDeviceInterfaces(hDevInfo, nullptr,
-                                     &GUID_DEVINTERFACE_USB_DEVICE, index++,
-                                     &interfaceData)) {
-    DWORD detailedSize = 0;
-    SetupDiGetDeviceInterfaceDetailW(hDevInfo, &interfaceData, nullptr, 0,
-                                     &detailedSize, nullptr);
-
-    std::vector<char> detailBuffer(detailedSize);
-    PSP_DEVICE_INTERFACE_DETAIL_DATA_W pInterfaceDetail =
-        (PSP_DEVICE_INTERFACE_DETAIL_DATA_W)detailBuffer.data();
-    pInterfaceDetail->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W);
-
-    SP_DEVINFO_DATA devInfoData;
-    devInfoData.cbSize = sizeof(SP_DEVINFO_DATA);
-
-    if (!SetupDiGetDeviceInterfaceDetailW(hDevInfo, &interfaceData,
-                                          pInterfaceDetail, detailedSize,
-                                          nullptr, &devInfoData)) {
+  while (SetupDiEnumDeviceInfo(hDevInfo, index++, &devInfoData)) {
+    wchar_t instanceId[MAX_DEVICE_ID_LEN];
+    if (!SetupDiGetDeviceInstanceIdW(hDevInfo, &devInfoData, instanceId,
+                                     MAX_DEVICE_ID_LEN, nullptr))
       continue;
-    }
 
-    std::wstring symPath(pInterfaceDetail->DevicePath);
-    std::wstring lowerPath = symPath;
-    for (auto &c : lowerPath)
-      c = towlower(c);
-
-    if (lowerPath.find(vidStr) != std::wstring::npos &&
-        lowerPath.find(pidStr) != std::wstring::npos) {
+    std::wstring wsId(instanceId);
+    if (wsId.find(vidStr) != std::wstring::npos &&
+        wsId.find(pidStr) != std::wstring::npos) {
       DWORD address = 0, busNumber = 0;
       SetupDiGetDeviceRegistryPropertyW(hDevInfo, &devInfoData, SPDRP_ADDRESS,
                                         nullptr, (PBYTE)&address,
@@ -102,7 +111,9 @@ bool GetUsbBusAndAddress(uint16_t targetVid, uint16_t targetPid,
 
       outBus = (uint8_t)busNumber;
       outAddress = (uint8_t)address;
-      outPath = symPath;
+      outDevInst = devInfoData.DevInst;
+      outInstanceId = instanceId;
+
       found = true;
       break;
     }
@@ -112,51 +123,96 @@ bool GetUsbBusAndAddress(uint16_t targetVid, uint16_t targetPid,
   return found;
 }
 
-HANDLE OpenVBoxUsbDriver() {
-  EnsureVBoxDriverLoaded();
+#include <newdev.h>
+#pragma comment(lib, "newdev.lib")
 
-  HANDLE hVBox = CreateFileW(VBOXUSB_DEVICE_NAME, GENERIC_READ | GENERIC_WRITE,
-                             FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
-                             OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+// Pre-installs VBoxUSB.inf into Driver Store if PnP hasn't loaded it yet
+bool EnsureVBoxInfInstalled() {
+  wchar_t exePath[MAX_PATH];
+  GetModuleFileNameW(NULL, exePath, MAX_PATH);
+  std::wstring dirPath(exePath);
+  dirPath = dirPath.substr(0, dirPath.find_last_of(L"\\/"));
+  std::wstring infPath = dirPath + L"\\VBoxUSB.inf";
 
-  return hVBox;
+  BOOL rebootRequired = FALSE;
+  // Pre-stage the INF file into driver store
+  return (UpdateDriverForPlugAndPlayDevicesW(NULL, L"USB\\Class_00",
+                                             infPath.c_str(), 0,
+                                             &rebootRequired) == TRUE);
 }
 
-bool CaptureDeviceWithVBox(HANDLE hVBox, uint16_t vid, uint16_t pid) {
+HANDLE OpenVBoxDeviceFilterHandle(uint16_t vid, uint16_t pid) {
   uint8_t realBus = 0, realAddress = 0;
-  std::wstring devicePath;
+  DEVINST devInst = 0;
+  std::wstring instanceId;
 
-  if (!GetUsbBusAndAddress(vid, pid, realBus, realAddress, devicePath)) {
+  if (!GetUsbDeviceNodeAndParams(vid, pid, realBus, realAddress, devInst,
+                                 instanceId)) {
     std::cerr << "[-] Error: Physical USB device not found on system bus!"
               << std::endl;
-    return false;
+    return INVALID_HANDLE_VALUE;
   }
 
   std::cout << "[+] Physical Hardware resolved -> Bus: " << (int)realBus
             << " | Address: " << (int)realAddress << std::endl;
 
-  VBOXUSB_CAPTURE_REQ req = {0};
-  req.vendorId = vid;
-  req.productId = pid;
-  req.revision = 0;
-  req.busNumber = realBus;
-  req.deviceAddress = realAddress;
-  req.flags = 0;
+  // Step 1: Ensure VBoxUSB.inf is recognized by Windows PnP
+  EnsureVBoxInfInstalled();
 
-  wcscpy_s(req.devicePath, 260, devicePath.c_str());
+  // Step 2: Inject VBoxUSB into UpperFilters and trigger PnP re-enumeration
+  AttachVBoxFilterToDevice(devInst);
 
-  DWORD bytesReturned = 0;
-  BOOL result = DeviceIoControl(
-      hVBox, VBOXUSB_IOCTL_CAPTURE_DEVICE, &req, sizeof(VBOXUSB_CAPTURE_REQ),
-      &req, sizeof(VBOXUSB_CAPTURE_REQ), &bytesReturned, NULL);
+  std::cout << "[*] Waiting for Windows PnP Manager to mount VBoxUSB device "
+               "interface..."
+            << std::endl;
 
-  if (!result) {
-    DWORD lastErr = GetLastError();
-    std::cerr << "[-] DeviceIoControl (CAPTURE) failed. Code: " << lastErr
-              << std::endl;
+  // Step 3: Retry interface lookup up to 10 times (5 seconds total)
+  for (int retry = 0; retry < 10; ++retry) {
+    Sleep(500); // 500ms delay per attempt
+
+    HDEVINFO hDevInfo =
+        SetupDiGetClassDevsW(&GUID_DEVINTERFACE_VBOXUSB, NULL, NULL,
+                             DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+    if (hDevInfo == INVALID_HANDLE_VALUE)
+      continue;
+
+    SP_DEVICE_INTERFACE_DATA interfaceData = {sizeof(SP_DEVICE_INTERFACE_DATA)};
+    DWORD index = 0;
+
+    while (SetupDiEnumDeviceInterfaces(
+        hDevInfo, NULL, &GUID_DEVINTERFACE_VBOXUSB, index++, &interfaceData)) {
+      DWORD detailSize = 0;
+      SetupDiGetDeviceInterfaceDetailW(hDevInfo, &interfaceData, NULL, 0,
+                                       &detailSize, NULL);
+
+      std::vector<char> buffer(detailSize);
+      PSP_DEVICE_INTERFACE_DETAIL_DATA_W pDetail =
+          (PSP_DEVICE_INTERFACE_DETAIL_DATA_W)buffer.data();
+      pDetail->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W);
+
+      if (SetupDiGetDeviceInterfaceDetailW(hDevInfo, &interfaceData, pDetail,
+                                           detailSize, NULL, NULL)) {
+        HANDLE hVBoxDevice =
+            CreateFileW(pDetail->DevicePath, GENERIC_READ | GENERIC_WRITE,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
+                        FILE_FLAG_OVERLAPPED, NULL);
+
+        if (hVBoxDevice != INVALID_HANDLE_VALUE) {
+          std::cout << "[+] Successfully opened kernel bridge handle to "
+                       "VBoxUSB filter driver!"
+                    << std::endl;
+          SetupDiDestroyDeviceInfoList(hDevInfo);
+          return hVBoxDevice;
+        }
+      }
+    }
+    SetupDiDestroyDeviceInfoList(hDevInfo);
   }
 
-  return (result == TRUE);
+  std::cerr
+      << "[-] Error: Failed to open VBoxUSB interface path after 5 seconds."
+      << std::endl;
+  return INVALID_HANDLE_VALUE;
 }
 
 std::vector<USBIP_DEVICE_DESC> ScanPhysicalUsbBus() {
@@ -214,22 +270,12 @@ void ConnectionWorkerThread(SOCKET clientSocket) {
       return;
     }
 
-    HANDLE hVBox = OpenVBoxUsbDriver();
-    if (hVBox == INVALID_HANDLE_VALUE) {
-      std::cerr << "[-] Error: Failed to open \\\\.\\VBoxUSBMon handle."
-                << std::endl;
+    // Attach VBoxUSB UpperFilter and open kernel handle to device interface
+    HANDLE hVBoxDevice = OpenVBoxDeviceFilterHandle(0x0781, 0x5590);
+    if (hVBoxDevice == INVALID_HANDLE_VALUE) {
       closesocket(clientSocket);
       return;
     }
-
-    if (!CaptureDeviceWithVBox(hVBox, 0x0781, 0x5590)) {
-      CloseHandle(hVBox);
-      closesocket(clientSocket);
-      return;
-    }
-
-    std::cout << "[+] Hardware successfully captured via VBoxUSBMon!"
-              << std::endl;
 
     USBIP_OP_REP_IMPORT importReply = {0};
     importReply.common.version = SWAP16(0x0111);
@@ -247,6 +293,7 @@ void ConnectionWorkerThread(SOCKET clientSocket) {
 
     send(clientSocket, (char *)&importReply, sizeof(USBIP_OP_REP_IMPORT), 0);
 
+    // Dynamic USB/IP -> VBoxUSB Kernel URB Bridge
     while (true) {
       USBIP_HEADER_BASIC basicHeader;
       if (!ReceiveExactBytes(clientSocket, (char *)&basicHeader,
@@ -293,10 +340,10 @@ void ConnectionWorkerThread(SOCKET clientSocket) {
         }
 
         DWORD bytesReturned = 0;
-        BOOL ioctlSuccess =
-            DeviceIoControl(hVBox, VBOXUSB_IOCTL_SUBMIT_URB, ioctlBuffer.data(),
-                            (DWORD)ioctlBuffer.size(), ioctlBuffer.data(),
-                            (DWORD)ioctlBuffer.size(), &bytesReturned, NULL);
+        BOOL ioctlSuccess = DeviceIoControl(
+            hVBoxDevice, VBOXUSB_IOCTL_SUBMIT_URB, ioctlBuffer.data(),
+            (DWORD)ioctlBuffer.size(), ioctlBuffer.data(),
+            (DWORD)ioctlBuffer.size(), &bytesReturned, NULL);
 
         int32_t actualTransferred = 0;
         if (ioctlSuccess && bytesReturned >= sizeof(VBOXUSB_URB_HDR)) {
@@ -332,14 +379,7 @@ void ConnectionWorkerThread(SOCKET clientSocket) {
       }
     }
 
-    VBOXUSB_CAPTURE_REQ releaseReq = {0};
-    releaseReq.vendorId = 0x0781;
-    releaseReq.productId = 0x5590;
-    DWORD dummy = 0;
-    DeviceIoControl(hVBox, VBOXUSB_IOCTL_RELEASE_DEVICE, &releaseReq,
-                    sizeof(releaseReq), NULL, 0, &dummy, NULL);
-
-    CloseHandle(hVBox);
+    CloseHandle(hVBoxDevice);
     closesocket(clientSocket);
   } else {
     closesocket(clientSocket);
