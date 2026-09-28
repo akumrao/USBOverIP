@@ -4,6 +4,7 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 
+#include <cstdint>
 #include <initguid.h>
 #include <string>
 #include <vector>
@@ -59,6 +60,34 @@ struct USBIP_OP_REP_IMPORT {
   USBIP_DEVICE_DESC dev;
 };
 
+struct USBIP_HEADER_BASIC {
+  uint32_t command;
+  uint32_t seqnum;
+  uint32_t devid;
+  uint32_t direction;
+  uint32_t ep;
+};
+
+struct USBIP_CMD_SUBMIT {
+  USBIP_HEADER_BASIC base;
+  uint32_t transferFlags;
+  int32_t transferBufferLength;
+  uint32_t startFrame;
+  uint32_t numberOfPackets;
+  uint32_t interval;
+  uint8_t setup[8];
+};
+
+struct USBIP_RET_SUBMIT {
+  USBIP_HEADER_BASIC base;
+  int32_t status;
+  int32_t actualLength;
+  uint32_t startFrame;
+  uint32_t numberOfPackets;
+  uint32_t errorCount;
+  uint8_t padding[4];
+};
+
 struct SP_DEVINFO_DATA {
   DWORD cbSize;
   GUID ClassGuid;
@@ -80,7 +109,6 @@ __declspec(dllimport)
 BOOL __stdcall SetupDiDestroyDeviceInfoList(HDEVINFO DeviceInfoSet);
 }
 
-// Global Core Implementation APIs
 bool IsDeviceAuthorizedInRegistry(const std::string &hardwareId);
 std::vector<USBIP_DEVICE_DESC> ScanPhysicalUsbBus();
 void ConnectionWorkerThread(SOCKET clientSocket);

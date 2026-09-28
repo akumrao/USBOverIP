@@ -6,7 +6,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Define the executable binary target pointing to the renamed source file
-add_executable(usbip_server usbipd.cpp)
+add_executable(usbip_server main.cpp usbipd.cpp)
 
 # Target-specific links to critical Windows Kernel System libraries
 target_link_libraries(usbip_server PRIVATE 
