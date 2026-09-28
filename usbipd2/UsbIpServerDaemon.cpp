@@ -1,5 +1,18 @@
 #include "UsbIpServerDaemon.hpp"
 
+// Utility to verify Administrator execution at startup
+static bool IsRunningAsAdmin() {
+    BOOL isAdmin = FALSE;
+    PSID adminGroup = NULL;
+    SID_IDENTIFIER_AUTHORITY ntAuthority = SECURITY_NT_AUTHORITY;
+    if (AllocateAndInitializeSid(&ntAuthority, 2, SECURITY_BUILTIN_DOMAIN_RID,
+        DOMAIN_ALIAS_RID_ADMINS, 0, 0, 0, 0, 0, 0, &adminGroup)) {
+        CheckTokenMembership(NULL, adminGroup, &isAdmin);
+        FreeSid(adminGroup);
+    }
+    return isAdmin == TRUE;
+}
+
 void UsbIpServerDaemon::SetDeviceAttached(const std::string& busId, bool attached) {
     std::lock_guard<std::mutex> lock(m_stateMutex);
     if (attached) {
@@ -89,12 +102,12 @@ bool UsbIpServerDaemon::OpenPhysicalUsbDevice(const std::string& busId, HANDLE& 
     );
 
     if (outDeviceHandle == INVALID_HANDLE_VALUE) {
-        std::cerr << "[ERROR] Failed to open physical USB device handle. Ensure WinUSB driver is assigned." << std::endl;
+        std::cerr << "[ERROR] Failed to open physical USB device handle." << std::endl;
         return false;
     }
 
     if (!WinUsb_Initialize(outDeviceHandle, &outWinUsbHandle)) {
-        std::cerr << "[ERROR] WinUsb_Initialize failed (Error Code: " << GetLastError() << L"). Running application as Administrator allows automatic INF WinUSB assignment." << std::endl;
+        std::cerr << "[ERROR] WinUsb_Initialize failed (Error Code: " << GetLastError() << ")." << std::endl;
         CloseHandle(outDeviceHandle);
         outDeviceHandle = INVALID_HANDLE_VALUE;
         return false;
@@ -194,6 +207,11 @@ void UsbIpServerDaemon::MaintainDataTunnel(SOCKET clientSocket, const std::strin
                     } else {
                         winUsbResult = WinUsb_WritePipe(hWinUsb, pipeId, (PUCHAR)transferPayload.data(), bufferLen, &bytesTransferred, NULL);
                     }
+
+                    // Auto-reset endpoint pipe if hardware stalls
+                    if (!winUsbResult) {
+                        WinUsb_ResetPipe(hWinUsb, pipeId);
+                    }
                 }
             } else {
                 winUsbResult = TRUE;
@@ -214,6 +232,7 @@ void UsbIpServerDaemon::MaintainDataTunnel(SOCKET clientSocket, const std::strin
         }
     }
 
+    // Always release handles to prevent host device locks
     if (hardwareAvailable) {
         WinUsb_Free(hWinUsb);
         CloseHandle(hDevice);
@@ -358,6 +377,11 @@ void UsbIpServerDaemon::StartDaemon() {
 }
 
 int main(int argc, char *argv[]) {
+    if (!IsRunningAsAdmin()) {
+        std::cerr << "[WARNING] usbip_server requires Administrator privileges for INF driver installation and registry access." << std::endl;
+        std::cerr << "          Please restart the command prompt as Administrator." << std::endl;
+    }
+
     UsbIpServerDaemon server;
 
     if (argc > 1) {
