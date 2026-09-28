@@ -22,6 +22,7 @@ typedef VOID *HDEVINFO;
 #define SWAP32(x) htonl(x)
 
 #pragma pack(push, 1)
+
 struct USBIP_OP_COMMON {
   uint16_t version;
   uint16_t commandCode;
@@ -85,7 +86,19 @@ struct USBIP_RET_SUBMIT {
   uint32_t startFrame;
   uint32_t numberOfPackets;
   uint32_t errorCount;
-  uint8_t padding[4];
+  uint8_t padding[8];
+};
+
+struct USBIP_CMD_UNLINK {
+  USBIP_HEADER_BASIC base;
+  uint32_t unlinkSeqnum;
+  uint8_t padding[24];
+};
+
+struct USBIP_RET_UNLINK {
+  USBIP_HEADER_BASIC base;
+  int32_t status;
+  uint8_t padding[24];
 };
 
 struct SP_DEVINFO_DATA {
@@ -94,6 +107,7 @@ struct SP_DEVINFO_DATA {
   DWORD DevInst;
   ULONG_PTR Reserved;
 };
+
 #pragma pack(pop)
 
 extern "C" {
@@ -109,6 +123,7 @@ __declspec(dllimport)
 BOOL __stdcall SetupDiDestroyDeviceInfoList(HDEVINFO DeviceInfoSet);
 }
 
+bool ReceiveExactBytes(SOCKET s, char *buffer, int bytesToRead);
 bool IsDeviceAuthorizedInRegistry(const std::string &hardwareId);
 std::vector<USBIP_DEVICE_DESC> ScanPhysicalUsbBus();
 void ConnectionWorkerThread(SOCKET clientSocket);

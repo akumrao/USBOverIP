@@ -4,6 +4,18 @@
 DEFINE_GUID(GUID_DEVCLASS_USB, 0x36fc9e60, 0xc465, 0x11cf, 0x80, 0x56, 0x44,
             0x45, 0x53, 0x54, 0x00, 0x00);
 
+bool ReceiveExactBytes(SOCKET s, char *buffer, int bytesToRead) {
+  int totalRead = 0;
+  while (totalRead < bytesToRead) {
+    int bytesRead = recv(s, buffer + totalRead, bytesToRead - totalRead, 0);
+    if (bytesRead <= 0) {
+      return false;
+    }
+    totalRead += bytesRead;
+  }
+  return true;
+}
+
 bool IsDeviceAuthorizedInRegistry(const std::string &hardwareId) {
   HKEY hKey;
   std::wstring baseSubKey = L"SOFTWARE\\usbipd-win\\Devices";
@@ -74,7 +86,7 @@ std::vector<USBIP_DEVICE_DESC> ScanPhysicalUsbBus() {
     strcpy_s(devExchange.busid, "1-1");
     devExchange.busnum = SWAP32(1);
     devExchange.devnum = SWAP32(2);
-    devExchange.speed = SWAP32(3);
+    devExchange.speed = SWAP32(3); // USB_SPEED_HIGH
     devExchange.idVendor = SWAP16(vid);
     devExchange.idProduct = SWAP16(pid);
     devExchange.bcdDevice = SWAP16(0x0100);
@@ -98,19 +110,18 @@ std::vector<USBIP_DEVICE_DESC> ScanPhysicalUsbBus() {
 }
 
 void ConnectionWorkerThread(SOCKET clientSocket) {
-  std::vector<char> networkBuffer(DEFAULT_BUFLEN);
-  int receivedBytes =
-      recv(clientSocket, networkBuffer.data(), sizeof(USBIP_OP_COMMON), 0);
-  if (receivedBytes <= 0) {
+  USBIP_OP_COMMON commonHeader;
+  if (!ReceiveExactBytes(clientSocket, (char *)&commonHeader,
+                         sizeof(USBIP_OP_COMMON))) {
     closesocket(clientSocket);
     return;
   }
 
-  USBIP_OP_COMMON *incomingHeader = (USBIP_OP_COMMON *)networkBuffer.data();
-  uint16_t evaluatedCommand = ntohs(incomingHeader->commandCode);
+  uint16_t evaluatedCommand = ntohs(commonHeader.commandCode);
   std::cout << "[*] Parsing Handshake Opcode: 0x" << std::hex
             << evaluatedCommand << std::endl;
 
+  // Handshake 1: Device List Request (OP_REQ_DEVLIST)
   if (evaluatedCommand == 0x8005) {
     std::vector<USBIP_DEVICE_DESC> activeList = ScanPhysicalUsbBus();
 
@@ -129,11 +140,11 @@ void ConnectionWorkerThread(SOCKET clientSocket) {
            0);
     }
     closesocket(clientSocket);
-  } else if (evaluatedCommand == 0x8003) {
-    int remainingBytes =
-        recv(clientSocket, networkBuffer.data() + sizeof(USBIP_OP_COMMON),
-             sizeof(USBIP_OP_REQ_IMPORT) - sizeof(USBIP_OP_COMMON), 0);
-    if (remainingBytes <= 0) {
+  }
+  // Handshake 2: Device Import Request (OP_REQ_IMPORT)
+  else if (evaluatedCommand == 0x8003) {
+    char busidReq[32];
+    if (!ReceiveExactBytes(clientSocket, busidReq, sizeof(busidReq))) {
       closesocket(clientSocket);
       return;
     }
@@ -161,48 +172,94 @@ void ConnectionWorkerThread(SOCKET clientSocket) {
                  "Bridge open."
               << std::endl;
 
-    USBIP_CMD_SUBMIT cmdSubmit = {0};
+    // Direct USB/IP Streaming Loop
     while (true) {
-      int liveStreamBytes =
-          recv(clientSocket, (char *)&cmdSubmit, sizeof(USBIP_CMD_SUBMIT), 0);
-      if (liveStreamBytes <= 0) {
+      USBIP_HEADER_BASIC basicHeader;
+      if (!ReceiveExactBytes(clientSocket, (char *)&basicHeader,
+                             sizeof(USBIP_HEADER_BASIC))) {
         std::cout << "[-] Windows Client dropped structural line link."
                   << std::endl;
         break;
       }
 
-      if (liveStreamBytes == sizeof(USBIP_CMD_SUBMIT)) {
-        uint32_t cmdType = ntohl(cmdSubmit.base.command);
-        uint32_t seqNum = ntohl(cmdSubmit.base.seqnum);
-        int32_t reqLen = ntohl(cmdSubmit.transferBufferLength);
-        uint32_t direction = ntohl(cmdSubmit.base.direction);
+      uint32_t cmdType = ntohl(basicHeader.command);
+      uint32_t seqNum = ntohl(basicHeader.seqnum);
+      uint32_t direction = ntohl(basicHeader.direction);
+
+      // Handle USBIP_CMD_SUBMIT (0x00000001)
+      if (cmdType == 0x00000001) {
+        // Read remaining payload after basic header (sizeof USBIP_CMD_SUBMIT -
+        // sizeof USBIP_HEADER_BASIC)
+        struct CMD_SUBMIT_TAIL {
+          uint32_t transferFlags;
+          int32_t transferBufferLength;
+          uint32_t startFrame;
+          uint32_t numberOfPackets;
+          uint32_t interval;
+          uint8_t setup[8];
+        } tail;
+
+        if (!ReceiveExactBytes(clientSocket, (char *)&tail, sizeof(tail))) {
+          break;
+        }
+
+        int32_t reqLen = ntohl(tail.transferBufferLength);
 
         std::cout << "[~] Windows I/O Transaction Stream -> Command: 0x"
                   << std::hex << cmdType << " | ID Token: " << std::dec
                   << seqNum << " | Expected Size: " << reqLen << " bytes."
                   << std::endl;
 
+        // Receive host payload if OUT transfer (direction == 0)
         if (direction == 0 && reqLen > 0) {
           std::vector<char> dataBuffer(reqLen);
-          recv(clientSocket, dataBuffer.data(), reqLen, 0);
+          if (!ReceiveExactBytes(clientSocket, dataBuffer.data(), reqLen)) {
+            break;
+          }
         }
 
         USBIP_RET_SUBMIT retSubmit = {0};
-        retSubmit.base.command = htonl(0x0002);
+        retSubmit.base.command = htonl(0x00000003); // RET_SUBMIT response ID
         retSubmit.base.seqnum = htonl(seqNum);
+        retSubmit.base.devid = basicHeader.devid;
         retSubmit.base.direction = htonl(direction);
-        retSubmit.status = htonl(0);
+        retSubmit.base.ep = basicHeader.ep;
+        retSubmit.status = htonl(0); // Success status
 
+        // Send IN transfer response payload (direction == 1)
         if (direction == 1 && reqLen > 0) {
           retSubmit.actualLength = htonl(reqLen);
           send(clientSocket, (char *)&retSubmit, sizeof(USBIP_RET_SUBMIT), 0);
 
-          std::vector<char> mockWindowsPayload(reqLen, 0);
-          send(clientSocket, mockWindowsPayload.data(), reqLen, 0);
+          std::vector<char> mockPayload(reqLen, 0);
+          send(clientSocket, mockPayload.data(), reqLen, 0);
         } else {
           retSubmit.actualLength = htonl(0);
           send(clientSocket, (char *)&retSubmit, sizeof(USBIP_RET_SUBMIT), 0);
         }
+      }
+      // Handle USBIP_CMD_UNLINK (0x00000002)
+      else if (cmdType == 0x00000002) {
+        struct CMD_UNLINK_TAIL {
+          uint32_t unlinkSeqnum;
+          uint8_t padding[24];
+        } unlinkTail;
+
+        if (!ReceiveExactBytes(clientSocket, (char *)&unlinkTail,
+                               sizeof(unlinkTail))) {
+          break;
+        }
+
+        USBIP_RET_UNLINK retUnlink = {0};
+        retUnlink.base.command = htonl(0x00000004); // RET_UNLINK response ID
+        retUnlink.base.seqnum = htonl(seqNum);
+        retUnlink.status = htonl(0); // Success (-ECONNRESET normally)
+
+        send(clientSocket, (char *)&retUnlink, sizeof(USBIP_RET_UNLINK), 0);
+      } else {
+        std::cerr << "[-] Unknown Command Type Received: 0x" << std::hex
+                  << cmdType << std::endl;
+        break;
       }
     }
     closesocket(clientSocket);
