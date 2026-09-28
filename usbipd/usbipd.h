@@ -4,34 +4,21 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 
-// 1. Core C++ Standard Library
 #include <cstdint>
 #include <string>
 #include <vector>
 
-// 2. Base Windows Header MUST BE FIRST among Windows SDK files
 #include <windows.h>
 
-// 3. Sockets & Subsystem Headers
 #include <winsock2.h>
 #include <ws2tcpip.h>
 
-// 4. Windows Hardware & Driver Headers (AFTER windows.h)
+#include <cfgmgr32.h>
 #include <initguid.h>
-#include <newdev.h>
 #include <setupapi.h>
-#include <winusb.h>
 
-// Ensure pragmas auto-link required Windows SDK libraries
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "setupapi.lib")
-#pragma comment(lib, "winusb.lib")
-#pragma comment(lib, "newdev.lib")
-
-
-
-
-
 
 #define DIGCF_PRESENT 0x00000002
 #define MAX_DEVICE_ID_LEN 200
@@ -124,8 +111,10 @@ struct USBIP_RET_UNLINK {
 #pragma pack(pop)
 
 bool ReceiveExactBytes(SOCKET s, char *buffer, int bytesToRead);
-bool BindWinUSBToDevice(const std::wstring &hardwareId,
-                        const std::wstring &infPath);
-HANDLE OpenPhysicalWinUSBDevice(WINUSB_INTERFACE_HANDLE *phWinUsb);
+bool EnsureVBoxDriverLoaded();
+bool GetUsbBusAndAddress(uint16_t targetVid, uint16_t targetPid,
+                         uint8_t &outBus, uint8_t &outAddress);
+HANDLE OpenVBoxUsbDriver();
+bool CaptureDeviceWithVBox(HANDLE hVBox, uint16_t vid, uint16_t pid);
 std::vector<USBIP_DEVICE_DESC> ScanPhysicalUsbBus();
 void ConnectionWorkerThread(SOCKET clientSocket);

@@ -2,9 +2,6 @@
 #include <iostream>
 #include <thread>
 
-//#include <windows.h>
-//#include <prsht.h>
-
 int main() {
   std::cout
       << "====================================================================="
@@ -66,8 +63,7 @@ int main() {
     SOCKET connectionAcceptHandle =
         accept(masterListenSocket, nullptr, nullptr);
     if (connectionAcceptHandle != INVALID_SOCKET) {
-      std::cout << "\n[+] Incoming connection intercepted! Dispatching worker "
-                   "thread..."
+      std::cout << "\n[+] Connection accepted! Dispatching worker thread..."
                 << std::endl;
       std::thread processingWorker(ConnectionWorkerThread,
                                    connectionAcceptHandle);

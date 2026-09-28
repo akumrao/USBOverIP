@@ -13,31 +13,168 @@ bool ReceiveExactBytes(SOCKET s, char *buffer, int bytesToRead) {
   return true;
 }
 
-// Opens a direct connection to VirtualBox's Kernel Driver
+// Dynamically registers and starts VBoxUSBMon.sys via SCM on demand
+bool EnsureVBoxDriverLoaded() {
+  wchar_t exePath[MAX_PATH];
+  GetModuleFileNameW(NULL, exePath, MAX_PATH);
+  std::wstring dirPath(exePath);
+  dirPath = dirPath.substr(0, dirPath.find_last_of(L"\\/"));
+  std::wstring sysPath = dirPath + L"\\VBoxUSBMon.sys";
+
+  SC_HANDLE hSCM = OpenSCManagerW(NULL, NULL, SC_MANAGER_ALL_ACCESS);
+  if (!hSCM)
+    return false;
+
+  SC_HANDLE hService = CreateServiceW(
+      hSCM, L"VBoxUSBMon", L"VirtualBox USB Monitor Service",
+      SERVICE_ALL_ACCESS, SERVICE_KERNEL_DRIVER, SERVICE_DEMAND_START,
+      SERVICE_ERROR_NORMAL, sysPath.c_str(), NULL, NULL, NULL, NULL, NULL);
+
+  if (!hService && GetLastError() == ERROR_SERVICE_EXISTS) {
+    hService = OpenServiceW(hSCM, L"VBoxUSBMon", SERVICE_ALL_ACCESS);
+  }
+
+  if (hService) {
+    StartServiceW(hService, 0, NULL);
+    CloseServiceHandle(hService);
+  }
+
+  CloseServiceHandle(hSCM);
+  return true;
+}
+
+bool GetUsbBusAndAddress(uint16_t targetVid, uint16_t targetPid,
+                         uint8_t &outBus, uint8_t &outAddress,
+                         std::wstring &outPath) {
+  HDEVINFO hDevInfo = SetupDiGetClassDevsW(nullptr, L"USB", nullptr,
+                                           DIGCF_PRESENT | DIGCF_ALLCLASSES);
+  if (hDevInfo == INVALID_HANDLE_VALUE)
+    return false;
+
+  SP_DEVINFO_DATA devInfoData;
+  devInfoData.cbSize = sizeof(SP_DEVINFO_DATA);
+  DWORD index = 0;
+  bool found = false;
+
+  wchar_t vidStr[16], pidStr[16];
+  swprintf_s(vidStr, L"VID_%04X", targetVid);
+  swprintf_s(pidStr, L"PID_%04X", targetPid);
+
+  while (SetupDiEnumDeviceInfo(hDevInfo, index++, &devInfoData)) {
+    wchar_t instanceId[MAX_DEVICE_ID_LEN];
+    if (!SetupDiGetDeviceInstanceIdW(hDevInfo, &devInfoData, instanceId,
+                                     MAX_DEVICE_ID_LEN, nullptr))
+      continue;
+
+    std::wstring wsId(instanceId);
+    if (wsId.find(vidStr) != std::wstring::npos &&
+        wsId.find(pidStr) != std::wstring::npos) {
+      DWORD address = 0, busNumber = 0;
+      SetupDiGetDeviceRegistryPropertyW(hDevInfo, &devInfoData, SPDRP_ADDRESS,
+                                        nullptr, (PBYTE)&address,
+                                        sizeof(address), nullptr);
+      SetupDiGetDeviceRegistryPropertyW(hDevInfo, &devInfoData, SPDRP_BUSNUMBER,
+                                        nullptr, (PBYTE)&busNumber,
+                                        sizeof(busNumber), nullptr);
+
+      outBus = (uint8_t)busNumber;
+      outAddress = (uint8_t)address;
+      outPath = wsId;
+      found = true;
+      break;
+    }
+  }
+
+  SetupDiDestroyDeviceInfoList(hDevInfo);
+  return found;
+}
+
 HANDLE OpenVBoxUsbDriver() {
-  HANDLE hVBox =
-      CreateFileW(VBOXUSB_DEVICE_NAME, GENERIC_READ | GENERIC_WRITE,
-                  FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
-                  FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED, NULL);
+  EnsureVBoxDriverLoaded();
+
+  HANDLE hVBox = CreateFileW(VBOXUSB_DEVICE_NAME, GENERIC_READ | GENERIC_WRITE,
+                             FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                             OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
 
   return hVBox;
 }
 
-// Intercepts and captures physical device via VBoxUSBMon.sys
+//bool CaptureDeviceWithVBox(HANDLE hVBox, uint16_t vid, uint16_t pid) {
+//  uint8_t realBus = 0, realAddress = 0;
+//  if (!GetUsbBusAndAddress(vid, pid, realBus, realAddress)) {
+//    std::cerr << "[-] Error: Physical USB device not found on system bus!"
+//              << std::endl;
+//    return false;
+//  }
+//
+//  std::cout << "[+] Physical Hardware resolved -> Bus: " << (int)realBus
+//            << " | Address: " << (int)realAddress << std::endl;
+//
+//  VBOXUSB_CAPTURE_REQ req = {0};
+//  req.vendorId = vid;
+//  req.productId = pid;
+//  req.busNumber = realBus;
+//  req.deviceAddress = realAddress;
+//
+//  DWORD bytesReturned = 0;
+//  BOOL result = DeviceIoControl(hVBox, VBOXUSB_IOCTL_CAPTURE_DEVICE, &req,
+//                                sizeof(req), NULL, 0, &bytesReturned, NULL);
+//
+//  if (!result) {
+//    DWORD lastErr = GetLastError();
+//    std::cerr << "[-] DeviceIoControl (CAPTURE) failed. Code: " << lastErr
+//              << std::endl;
+//  }
+//
+//  return (result == TRUE);
+//}
 bool CaptureDeviceWithVBox(HANDLE hVBox, uint16_t vid, uint16_t pid) {
+  uint8_t realBus = 0, realAddress = 0;
+  std::wstring devicePath;
+
+  if (!GetUsbBusAndAddress(vid, pid, realBus, realAddress, devicePath)) {
+    std::cerr << "[-] Error: Physical USB device not found on system bus!"
+              << std::endl;
+    return false;
+  }
+
+  std::cout << "[+] Physical Hardware resolved -> Bus: " << (int)realBus
+            << " | Address: " << (int)realAddress << std::endl;
+
   VBOXUSB_CAPTURE_REQ req = {0};
   req.vendorId = vid;
   req.productId = pid;
-  req.busNumber = 1;
-  req.deviceAddress = 2;
+  req.busNumber = realBus;
+  req.deviceAddress = realAddress;
+  req.flags = 0;
+
+  //// Copy instance path into the struct
+  //wcscpy_s(req.devicePath, 260, devicePath.c_str());
+
+  //DWORD bytesReturned = 0;
+  //BOOL result = DeviceIoControl(
+  //    hVBox, VBOXUSB_IOCTL_CAPTURE_DEVICE, &req, sizeof(VBOXUSB_CAPTURE_REQ),
+  //    &req, sizeof(VBOXUSB_CAPTURE_REQ), &bytesReturned, NULL);
+
+    // Copy instance path into the struct
+  wcscpy_s(req.devicePath, 260, devicePath.c_str());
 
   DWORD bytesReturned = 0;
-  BOOL result = DeviceIoControl(hVBox, VBOXUSB_IOCTL_CAPTURE_DEVICE, &req,
-                                sizeof(req), NULL, 0, &bytesReturned, NULL);
+  BOOL result =
+      DeviceIoControl(hVBox, VBOXUSB_IOCTL_CAPTURE_DEVICE, &req,
+                      sizeof(VBOXUSB_CAPTURE_REQ), // Input buffer
+                      NULL, 0, // Fix: Clear output buffer configurations
+                      &bytesReturned, NULL);
+
+
+  if (!result) {
+    DWORD lastErr = GetLastError();
+    std::cerr << "[-] DeviceIoControl (CAPTURE) failed. Code: " << lastErr
+              << std::endl;
+  }
 
   return (result == TRUE);
 }
-
 std::vector<USBIP_DEVICE_DESC> ScanPhysicalUsbBus() {
   std::vector<USBIP_DEVICE_DESC> detectedDevices;
   USBIP_DEVICE_DESC devExchange = {0};
@@ -93,28 +230,21 @@ void ConnectionWorkerThread(SOCKET clientSocket) {
       return;
     }
 
-    // Connect to VBoxUSBMon.sys Kernel Handle
     HANDLE hVBox = OpenVBoxUsbDriver();
     if (hVBox == INVALID_HANDLE_VALUE) {
-      std::cerr << "[-] Error: VBoxUSBMon.sys driver not found. Ensure "
-                   "VirtualBox is installed!"
+      std::cerr << "[-] Error: Failed to open \\\\.\\VBoxUSBMon handle."
                 << std::endl;
       closesocket(clientSocket);
       return;
     }
 
-    // Capture target hardware VID/PID using VirtualBox kernel IOCTL
     if (!CaptureDeviceWithVBox(hVBox, 0x0781, 0x5590)) {
-      std::cerr
-          << "[-] Error: VBoxUSBMon failed to capture target physical hardware."
-          << std::endl;
       CloseHandle(hVBox);
       closesocket(clientSocket);
       return;
     }
 
-    std::cout << "[+] Physical Hardware successfully captured via "
-                 "VBoxUSBMon.sys Kernel Driver!"
+    std::cout << "[+] Hardware successfully captured via VBoxUSBMon!"
               << std::endl;
 
     USBIP_OP_REP_IMPORT importReply = {0};
@@ -133,7 +263,7 @@ void ConnectionWorkerThread(SOCKET clientSocket) {
 
     send(clientSocket, (char *)&importReply, sizeof(USBIP_OP_REP_IMPORT), 0);
 
-    // Streaming Loop: Bridge USB/IP commands directly to VBoxUSBMon
+    // Live USB/IP -> VBoxUSBMon Streaming Loop
     while (true) {
       USBIP_HEADER_BASIC basicHeader;
       if (!ReceiveExactBytes(clientSocket, (char *)&basicHeader,
@@ -166,7 +296,6 @@ void ConnectionWorkerThread(SOCKET clientSocket) {
             break;
         }
 
-        // Construct VirtualBox Kernel URB Request Packet
         std::vector<char> ioctlBuffer(sizeof(VBOXUSB_URB_HDR) +
                                       (reqLen > 0 ? reqLen : 0));
         VBOXUSB_URB_HDR *pVBoxUrb = (VBOXUSB_URB_HDR *)ioctlBuffer.data();
@@ -181,11 +310,13 @@ void ConnectionWorkerThread(SOCKET clientSocket) {
         }
 
         DWORD bytesReturned = 0;
-        // Dispatch URB directly to VBoxUSBMon kernel stack
         BOOL ioctlSuccess =
             DeviceIoControl(hVBox, VBOXUSB_IOCTL_SUBMIT_URB, ioctlBuffer.data(),
                             (DWORD)ioctlBuffer.size(), ioctlBuffer.data(),
                             (DWORD)ioctlBuffer.size(), &bytesReturned, NULL);
+
+
+
 
         int32_t actualTransferred = 0;
         if (ioctlSuccess && bytesReturned >= sizeof(VBOXUSB_URB_HDR)) {
@@ -221,7 +352,6 @@ void ConnectionWorkerThread(SOCKET clientSocket) {
       }
     }
 
-    // Release device from VirtualBox Kernel Driver on disconnect
     VBOXUSB_CAPTURE_REQ releaseReq = {0};
     releaseReq.vendorId = 0x0781;
     releaseReq.productId = 0x5590;
