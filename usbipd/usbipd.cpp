@@ -1,112 +1,165 @@
 #include "usbipd.h"
 #include <iostream>
-#include <vector>
+#include <newdev.h>
 
-DEFINE_GUID(GUID_DEVCLASS_USB, 0x36fc9e60, 0xc465, 0x11cf, 0x80, 0x56, 0x44,
-            0x45, 0x53, 0x54, 0x00, 0x00);
+DEFINE_GUID(GUID_DEVINTERFACE_USB_DEVICE, 0xA5DCBF10, 0x6530, 0x11D2, 0x90,
+            0x1F, 0x00, 0xC0, 0x4F, 0xB9, 0x51, 0xED);
 
 bool ReceiveExactBytes(SOCKET s, char *buffer, int bytesToRead) {
   int totalRead = 0;
   while (totalRead < bytesToRead) {
     int bytesRead = recv(s, buffer + totalRead, bytesToRead - totalRead, 0);
-    if (bytesRead <= 0) {
+    if (bytesRead <= 0)
       return false;
-    }
     totalRead += bytesRead;
   }
   return true;
 }
 
-bool IsDeviceAuthorizedInRegistry(const std::string &hardwareId) {
-  HKEY hKey;
-  std::wstring baseSubKey = L"SOFTWARE\\usbipd-win\\Devices";
+bool BindWinUSBToDevice(const std::wstring &hardwareId,
+                        const std::wstring &infPath) {
+  BOOL rebootRequired = FALSE;
+  std::cout << "[+] Swapping driver to WinUSB for "
+            << std::string(hardwareId.begin(), hardwareId.end()) << "..."
+            << std::endl;
+  std::cout << "[*] Using INF Path: "
+            << std::string(infPath.begin(), infPath.end()) << std::endl;
 
-  LONG result =
-      RegOpenKeyExW(HKEY_LOCAL_MACHINE, baseSubKey.c_str(), 0, KEY_READ, &hKey);
-  if (result != ERROR_SUCCESS) {
-    return false;
-  }
+  BOOL success = UpdateDriverForPlugAndPlayDevicesW(
+      NULL, hardwareId.c_str(), infPath.c_str(),
+      INSTALLFLAG_FORCE | INSTALLFLAG_READONLY, &rebootRequired);
 
-  DWORD index = 0;
-  wchar_t subKeyName[256];
-  DWORD subKeyNameSize = 256;
-  bool matchFound = false;
-  std::wstring targetIdW(hardwareId.begin(), hardwareId.end());
-
-  while (RegEnumKeyExW(hKey, index, subKeyName, &subKeyNameSize, nullptr,
-                       nullptr, nullptr, nullptr) == ERROR_SUCCESS) {
-    std::wstring currentKey(subKeyName);
-    if (currentKey.find(targetIdW) != std::wstring::npos) {
-      matchFound = true;
-      break;
+  if (!success) {
+    DWORD err = GetLastError();
+    std::cerr << "[-] Driver Swap Failed! Win32 Error Code: " << err << " (0x"
+              << std::hex << err << ")" << std::endl;
+    if (err == 0x800F022F || err == 2) {
+      std::cerr << "    -> Cause: INF file not found or invalid format."
+                << std::endl;
+    } else if (err == 0x800F0203) {
+      std::cerr << "    -> Cause: Hardware ID in INF does not match the "
+                   "connected USB device."
+                << std::endl;
+    } else if (err == 0x80070005) {
+      std::cerr
+          << "    -> Cause: Access Denied. Must run server as Administrator."
+          << std::endl;
     }
-    subKeyNameSize = 256;
-    index++;
+  } else {
+    std::cout << "[+] Driver Swap Succeeded!" << std::endl;
   }
 
-  RegCloseKey(hKey);
-  return matchFound;
+  return (success == TRUE);
+}
+
+// Opens WinUSB interface handle to route live physical USB traffic
+//HANDLE OpenPhysicalWinUSBDevice(WINUSB_INTERFACE_HANDLE *phWinUsb) {
+//  HDEVINFO hDevInfo =
+//      SetupDiGetClassDevsW(&GUID_DEVINTERFACE_USB_DEVICE, NULL, NULL,
+//                           DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+//  if (hDevInfo == INVALID_HANDLE_VALUE)
+//    return INVALID_HANDLE_VALUE;
+//
+//  SP_DEVICE_INTERFACE_DATA interfaceData = {sizeof(SP_DEVICE_INTERFACE_DATA)};
+//  DWORD index = 0;
+//  HANDLE hDevice = INVALID_HANDLE_VALUE;
+//
+//  while (SetupDiEnumDeviceInterfaces(
+//      hDevInfo, NULL, &GUID_DEVINTERFACE_USB_DEVICE, index++, &interfaceData)) {
+//    DWORD detailSize = 0;
+//    SetupDiGetDeviceInterfaceDetailW(hDevInfo, &interfaceData, NULL, 0,
+//                                     &detailSize, NULL);
+//
+//    std::vector<char> buffer(detailSize);
+//    PSP_DEVICE_INTERFACE_DETAIL_DATA_W pDetail =
+//        (PSP_DEVICE_INTERFACE_DETAIL_DATA_W)buffer.data();
+//    pDetail->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W);
+//
+//    if (SetupDiGetDeviceInterfaceDetailW(hDevInfo, &interfaceData, pDetail,
+//                                         detailSize, NULL, NULL)) {
+//      hDevice = CreateFileW(pDetail->DevicePath, GENERIC_READ | GENERIC_WRITE,
+//                            FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+//                            OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
+//      if (hDevice != INVALID_HANDLE_VALUE) {
+//        if (WinUsb_Initialize(hDevice, phWinUsb)) {
+//          SetupDiDestroyDeviceInfoList(hDevInfo);
+//          return hDevice;
+//        }
+//        CloseHandle(hDevice);
+//      }
+//    }
+//  }
+//
+//  SetupDiDestroyDeviceInfoList(hDevInfo);
+//  return INVALID_HANDLE_VALUE;
+//}
+
+// 2. Update OpenPhysicalWinUSBDevice() with polling retries:
+HANDLE OpenPhysicalWinUSBDevice(WINUSB_INTERFACE_HANDLE *phWinUsb) {
+  // Retry up to 5 times to account for PnP startup latency
+  for (int retry = 0; retry < 5; ++retry) {
+    HDEVINFO hDevInfo =
+        SetupDiGetClassDevsW(&GUID_DEVINTERFACE_USB_DEVICE, NULL, NULL,
+                             DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+    if (hDevInfo == INVALID_HANDLE_VALUE) {
+      Sleep(500);
+      continue;
+    }
+
+    SP_DEVICE_INTERFACE_DATA interfaceData = {sizeof(SP_DEVICE_INTERFACE_DATA)};
+    DWORD index = 0;
+
+    while (SetupDiEnumDeviceInterfaces(hDevInfo, NULL,
+                                       &GUID_DEVINTERFACE_USB_DEVICE, index++,
+                                       &interfaceData)) {
+      DWORD detailSize = 0;
+      SetupDiGetDeviceInterfaceDetailW(hDevInfo, &interfaceData, NULL, 0,
+                                       &detailSize, NULL);
+
+      std::vector<char> buffer(detailSize);
+      PSP_DEVICE_INTERFACE_DETAIL_DATA_W pDetail =
+          (PSP_DEVICE_INTERFACE_DETAIL_DATA_W)buffer.data();
+      pDetail->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W);
+
+      if (SetupDiGetDeviceInterfaceDetailW(hDevInfo, &interfaceData, pDetail,
+                                           detailSize, NULL, NULL)) {
+        HANDLE hDevice =
+            CreateFileW(pDetail->DevicePath, GENERIC_READ | GENERIC_WRITE,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
+                        FILE_FLAG_OVERLAPPED, NULL);
+        if (hDevice != INVALID_HANDLE_VALUE) {
+          if (WinUsb_Initialize(hDevice, phWinUsb)) {
+            SetupDiDestroyDeviceInfoList(hDevInfo);
+            return hDevice; // Successfully opened WinUSB handle
+          }
+          CloseHandle(hDevice);
+        }
+      }
+    }
+    SetupDiDestroyDeviceInfoList(hDevInfo);
+    Sleep(500); // Wait before attempting next retry
+  }
+
+  return INVALID_HANDLE_VALUE;
 }
 
 std::vector<USBIP_DEVICE_DESC> ScanPhysicalUsbBus() {
   std::vector<USBIP_DEVICE_DESC> detectedDevices;
-  HDEVINFO hDevInfo =
-      SetupDiGetClassDevsW(&GUID_DEVCLASS_USB, nullptr, nullptr, DIGCF_PRESENT);
-  if (hDevInfo == (HDEVINFO)(INVALID_HANDLE_VALUE))
-    return detectedDevices;
+  USBIP_DEVICE_DESC devExchange = {0};
 
-  SP_DEVINFO_DATA devInfoData;
-  devInfoData.cbSize = sizeof(SP_DEVINFO_DATA);
-  DWORD index = 0;
+  strcpy_s(devExchange.path, "/sys/devices/platform/virtual_host_hub/usb1/1-1");
+  strcpy_s(devExchange.busid, "1-1");
+  devExchange.busnum = SWAP32(1);
+  devExchange.devnum = SWAP32(2);
+  devExchange.speed = SWAP32(3);          // High Speed
+  devExchange.idVendor = SWAP16(0x0781);  // SanDisk VID
+  devExchange.idProduct = SWAP16(0x5590); // Product PID
+  devExchange.bcdDevice = SWAP16(0x0100);
+  devExchange.bDeviceClass = 0x00;
+  devExchange.bNumConfigurations = 1;
+  devExchange.bNumInterfaces = 1;
 
-  while (SetupDiEnumDeviceInfo(hDevInfo, index, &devInfoData)) {
-    index++;
-    wchar_t instanceId[MAX_DEVICE_ID_LEN];
-    if (!SetupDiGetDeviceInstanceIdW(hDevInfo, &devInfoData, instanceId,
-                                     MAX_DEVICE_ID_LEN, nullptr)) {
-      continue;
-    }
-
-    std::wstring wsInstanceId(instanceId);
-    if (wsInstanceId.find(L"USB\\VID_") != 0)
-      continue;
-
-    size_t vidPos = wsInstanceId.find(L"VID_");
-    size_t pidPos = wsInstanceId.find(L"PID_");
-    if (vidPos == std::wstring::npos || pidPos == std::wstring::npos)
-      continue;
-
-    std::wstring vidStr = wsInstanceId.substr(vidPos + 4, 4);
-    std::wstring pidStr = wsInstanceId.substr(pidPos + 4, 4);
-    uint16_t vid = (uint16_t)std::stoul(vidStr, nullptr, 16);
-    uint16_t pid = (uint16_t)std::stoul(pidStr, nullptr, 16);
-
-    USBIP_DEVICE_DESC devExchange = {0};
-    strcpy_s(devExchange.path,
-             "/sys/devices/platform/virtual_host_hub/usb1/1-1");
-    strcpy_s(devExchange.busid, "1-1");
-    devExchange.busnum = SWAP32(1);
-    devExchange.devnum = SWAP32(2);
-    devExchange.speed = SWAP32(3); // High speed
-    devExchange.idVendor = SWAP16(vid);
-    devExchange.idProduct = SWAP16(pid);
-    devExchange.bcdDevice = SWAP16(0x0100);
-    devExchange.bDeviceClass = 0x00;
-    devExchange.bNumConfigurations = 1;
-    devExchange.bNumInterfaces = 1;
-
-    std::string rawHardwareStr(wsInstanceId.begin(), wsInstanceId.end());
-    std::cout << "[+] Found Device -> VID: " << std::hex << vid
-              << " PID: " << std::hex << pid;
-    if (IsDeviceAuthorizedInRegistry(rawHardwareStr)) {
-      std::cout << " [AUTHORIZED FOR SHARE]" << std::endl;
-    } else {
-      std::cout << " [LOCAL ONLY]" << std::endl;
-    }
-    detectedDevices.push_back(devExchange);
-  }
-
-  SetupDiDestroyDeviceInfoList(hDevInfo);
+  detectedDevices.push_back(devExchange);
   return detectedDevices;
 }
 
@@ -119,12 +172,11 @@ void ConnectionWorkerThread(SOCKET clientSocket) {
   }
 
   uint16_t evaluatedCommand = ntohs(commonHeader.commandCode);
-  std::cout << "[*] Parsing Handshake Opcode: 0x" << std::hex
-            << evaluatedCommand << std::endl;
+  std::cout << "[*] Handshake Opcode: 0x" << std::hex << evaluatedCommand
+            << std::endl;
 
-  if (evaluatedCommand == 0x8005) {
+  if (evaluatedCommand == 0x8005) { // OP_REQ_DEVLIST
     std::vector<USBIP_DEVICE_DESC> activeList = ScanPhysicalUsbBus();
-
     USBIP_OP_REP_DEVLIST listReply = {0};
     listReply.common.version = SWAP16(0x0111);
     listReply.common.commandCode = SWAP16(0x0005);
@@ -132,20 +184,43 @@ void ConnectionWorkerThread(SOCKET clientSocket) {
     listReply.numDevices = SWAP32((uint32_t)activeList.size());
 
     send(clientSocket, (char *)&listReply, sizeof(USBIP_OP_REP_DEVLIST), 0);
-    for (auto &individualDevice : activeList) {
-      send(clientSocket, (char *)&individualDevice, sizeof(USBIP_DEVICE_DESC),
-           0);
+    for (auto &device : activeList) {
+      send(clientSocket, (char *)&device, sizeof(USBIP_DEVICE_DESC), 0);
       uint8_t interfaceSubBlock[] = {0x00, 0x00, 0x00, 0x00};
       send(clientSocket, (char *)interfaceSubBlock, sizeof(interfaceSubBlock),
            0);
     }
     closesocket(clientSocket);
-  } else if (evaluatedCommand == 0x8003) {
+  } else if (evaluatedCommand == 0x8003) { // OP_REQ_IMPORT
     char busidReq[32];
     if (!ReceiveExactBytes(clientSocket, busidReq, sizeof(busidReq))) {
       closesocket(clientSocket);
       return;
     }
+
+    // Force driver swap to WinUSB on host machine
+    wchar_t exePath[MAX_PATH];
+    GetModuleFileNameW(NULL, exePath, MAX_PATH);
+    std::wstring infPath(exePath);
+    infPath = infPath.substr(0, infPath.find_last_of(L"\\/")) + L"\\winusb.inf";
+
+    BindWinUSBToDevice(L"USB\\VID_0781&PID_5590", infPath);
+
+    Sleep(1000);
+
+    // Initialize Physical WinUSB Handle
+    WINUSB_INTERFACE_HANDLE hWinUsb = NULL;
+    HANDLE hDevice = OpenPhysicalWinUSBDevice(&hWinUsb);
+
+    if (hDevice == INVALID_HANDLE_VALUE) {
+      std::cerr
+          << "[-] Error: Failed to open WinUSB handle to physical USB device."
+          << std::endl;
+      closesocket(clientSocket);
+      return;
+    }
+
+    std::cout << "[+] Physical USB Hardware Bridge Engaged!" << std::endl;
 
     USBIP_OP_REP_IMPORT importReply = {0};
     importReply.common.version = SWAP16(0x0111);
@@ -160,24 +235,15 @@ void ConnectionWorkerThread(SOCKET clientSocket) {
     importReply.dev.speed = SWAP32(3);
     importReply.dev.idVendor = SWAP16(0x0781);
     importReply.dev.idProduct = SWAP16(0x5590);
-    importReply.dev.bcdDevice = SWAP16(0x0100);
-    importReply.dev.bDeviceClass = 0x00;
-    importReply.dev.bNumConfigurations = 1;
-    importReply.dev.bNumInterfaces = 1;
 
     send(clientSocket, (char *)&importReply, sizeof(USBIP_OP_REP_IMPORT), 0);
-    std::cout << "[+] Sent OP_REP_IMPORT acknowledgement to Windows Client. "
-                 "Bridge open."
-              << std::endl;
 
+    // Dynamic Hardware Streaming Loop
     while (true) {
       USBIP_HEADER_BASIC basicHeader;
       if (!ReceiveExactBytes(clientSocket, (char *)&basicHeader,
-                             sizeof(USBIP_HEADER_BASIC))) {
-        std::cout << "[-] Windows Client dropped structural line link."
-                  << std::endl;
+                             sizeof(USBIP_HEADER_BASIC)))
         break;
-      }
 
       uint32_t cmdType = ntohl(basicHeader.command);
       uint32_t seqNum = ntohl(basicHeader.seqnum);
@@ -185,7 +251,7 @@ void ConnectionWorkerThread(SOCKET clientSocket) {
       uint32_t ep = ntohl(basicHeader.ep);
 
       if (cmdType == 0x00000001) { // USBIP_CMD_SUBMIT
-        struct CMD_SUBMIT_TAIL {
+        struct CMD_TAIL {
           uint32_t transferFlags;
           int32_t transferBufferLength;
           uint32_t startFrame;
@@ -194,21 +260,39 @@ void ConnectionWorkerThread(SOCKET clientSocket) {
           uint8_t setup[8];
         } tail;
 
-        if (!ReceiveExactBytes(clientSocket, (char *)&tail, sizeof(tail))) {
+        if (!ReceiveExactBytes(clientSocket, (char *)&tail, sizeof(tail)))
           break;
-        }
-
         int32_t reqLen = ntohl(tail.transferBufferLength);
 
-        std::cout << "[~] Stream -> Cmd: 0x" << std::hex << cmdType
-                  << " | EP: " << std::dec << ep << " | ID Token: " << seqNum
-                  << " | Expected Size: " << reqLen << " bytes." << std::endl;
+        std::vector<char> dataBuffer(reqLen > 0 ? reqLen : 0);
 
-        // OUT Transfers (Host -> Device)
+        // Host-to-Device Payload
         if (direction == 0 && reqLen > 0) {
-          std::vector<char> dataBuffer(reqLen);
-          if (!ReceiveExactBytes(clientSocket, dataBuffer.data(), reqLen)) {
+          if (!ReceiveExactBytes(clientSocket, dataBuffer.data(), reqLen))
             break;
+        }
+
+        ULONG bytesTransferred = 0;
+
+        // Route Control Endpoint (EP0) directly to hardware
+        if (ep == 0) {
+          WINUSB_SETUP_PACKET setupPacket;
+          memcpy(&setupPacket, tail.setup, 8);
+
+          WinUsb_ControlTransfer(hWinUsb, setupPacket,
+                                 (PUCHAR)dataBuffer.data(), reqLen,
+                                 &bytesTransferred, NULL);
+        }
+        // Route Bulk Endpoints (EP1, EP2, etc.) directly to hardware
+        else {
+          UCHAR pipeID = (direction == 1) ? (0x80 | (UCHAR)ep) : (UCHAR)ep;
+
+          if (direction == 1) { // Bulk IN Read
+            WinUsb_ReadPipe(hWinUsb, pipeID, (PUCHAR)dataBuffer.data(), reqLen,
+                            &bytesTransferred, NULL);
+          } else { // Bulk OUT Write
+            WinUsb_WritePipe(hWinUsb, pipeID, (PUCHAR)dataBuffer.data(), reqLen,
+                             &bytesTransferred, NULL);
           }
         }
 
@@ -218,148 +302,30 @@ void ConnectionWorkerThread(SOCKET clientSocket) {
         retSubmit.base.devid = basicHeader.devid;
         retSubmit.base.direction = htonl(direction);
         retSubmit.base.ep = basicHeader.ep;
-        retSubmit.status = htonl(0); // Success
+        retSubmit.status = htonl(0);
+        retSubmit.actualLength = htonl((int32_t)bytesTransferred);
 
-        // IN Transfers (Device -> Host)
-        if (direction == 1 && reqLen > 0) {
-          std::vector<char> payloadBuffer(reqLen, 0);
-
-          // Parse EP0 Control Setup Request
-          if (ep == 0) {
-            uint8_t bmRequestType = tail.setup[0];
-            uint8_t bRequest = tail.setup[1];
-            uint8_t descriptorType = tail.setup[3];
-            uint8_t descriptorIndex = tail.setup[2];
-
-            // 0x06 = GET_DESCRIPTOR
-            if (bRequest == 0x06) {
-              // Device Descriptor (0x01)
-              if (descriptorType == 0x01) {
-                USB_DEVICE_DESCRIPTOR devDesc = {0};
-                devDesc.bLength = sizeof(USB_DEVICE_DESCRIPTOR);
-                devDesc.bDescriptorType = 0x01;
-                devDesc.bcdUSB = 0x0200; // USB 2.0
-                devDesc.bDeviceClass = 0x00;
-                devDesc.bDeviceSubClass = 0x00;
-                devDesc.bDeviceProtocol = 0x00;
-                devDesc.bMaxPacketSize0 = 64;
-                devDesc.idVendor = 0x0781;  // SanDisk
-                devDesc.idProduct = 0x5590; // Ultra USB
-                devDesc.bcdDevice = 0x0100;
-                devDesc.iManufacturer = 1;
-                devDesc.iProduct = 2;
-                devDesc.iSerialNumber = 3;
-                devDesc.bNumConfigurations = 1;
-
-                int copyLen = (reqLen < (int)sizeof(devDesc))
-                                  ? reqLen
-                                  : (int)sizeof(devDesc);
-                memcpy(payloadBuffer.data(), &devDesc, copyLen);
-              }
-              // Configuration Descriptor (0x02)
-              else if (descriptorType == 0x02) {
-                USB_FULL_CONFIG_PACKET fullConfig = {0};
-
-                // Config Header
-                fullConfig.config.bLength =
-                    sizeof(USB_CONFIGURATION_DESCRIPTOR);
-                fullConfig.config.bDescriptorType = 0x02;
-                fullConfig.config.wTotalLength = sizeof(USB_FULL_CONFIG_PACKET);
-                fullConfig.config.bNumInterfaces = 1;
-                fullConfig.config.bConfigurationValue = 1;
-                fullConfig.config.iConfiguration = 0;
-                fullConfig.config.bmAttributes = 0x80; // Bus powered
-                fullConfig.config.bMaxPower = 50;      // 100mA
-
-                // Mass Storage Interface
-                fullConfig.interface0.bLength =
-                    sizeof(USB_INTERFACE_DESCRIPTOR);
-                fullConfig.interface0.bDescriptorType = 0x04;
-                fullConfig.interface0.bInterfaceNumber = 0;
-                fullConfig.interface0.bAlternateSetting = 0;
-                fullConfig.interface0.bNumEndpoints = 2;
-                fullConfig.interface0.bInterfaceClass = 0x08; // Mass Storage
-                fullConfig.interface0.bInterfaceSubClass =
-                    0x06; // SCSI Transparent
-                fullConfig.interface0.bInterfaceProtocol = 0x50; // Bulk-Only
-                fullConfig.interface0.iInterface = 0;
-
-                // Bulk IN Endpoint
-                fullConfig.epIn.bLength = sizeof(USB_ENDPOINT_DESCRIPTOR);
-                fullConfig.epIn.bDescriptorType = 0x05;
-                fullConfig.epIn.bEndpointAddress = 0x81; // EP1 IN
-                fullConfig.epIn.bmAttributes = 0x02;     // Bulk
-                fullConfig.epIn.wMaxPacketSize = 512;
-                fullConfig.epIn.bInterval = 0;
-
-                // Bulk OUT Endpoint
-                fullConfig.epOut.bLength = sizeof(USB_ENDPOINT_DESCRIPTOR);
-                fullConfig.epOut.bDescriptorType = 0x05;
-                fullConfig.epOut.bEndpointAddress = 0x01; // EP1 OUT
-                fullConfig.epOut.bmAttributes = 0x02;     // Bulk
-                fullConfig.epOut.wMaxPacketSize = 512;
-                fullConfig.epOut.bInterval = 0;
-
-                int copyLen = (reqLen < (int)sizeof(fullConfig))
-                                  ? reqLen
-                                  : (int)sizeof(fullConfig);
-                memcpy(payloadBuffer.data(), &fullConfig, copyLen);
-              }
-              // String Descriptors (0x03)
-              else if (descriptorType == 0x03) {
-                if (descriptorIndex == 0) { // Supported Languages
-                  uint8_t langDesc[] = {0x04, 0x03, 0x09,
-                                        0x04}; // EN-US (0x0409)
-                  int copyLen = (reqLen < (int)sizeof(langDesc))
-                                    ? reqLen
-                                    : (int)sizeof(langDesc);
-                  memcpy(payloadBuffer.data(), langDesc, copyLen);
-                } else if (descriptorIndex == 1) { // Manufacturer
-                  wchar_t mfgStr[] = L"Virtual USB";
-                  uint8_t len = (uint8_t)(sizeof(mfgStr));
-                  payloadBuffer[0] = len + 2;
-                  payloadBuffer[1] = 0x03;
-                  memcpy(payloadBuffer.data() + 2, mfgStr, len);
-                } else if (descriptorIndex == 2) { // Product
-                  wchar_t prodStr[] = L"Emulated Mass Storage";
-                  uint8_t len = (uint8_t)(sizeof(prodStr));
-                  payloadBuffer[0] = len + 2;
-                  payloadBuffer[1] = 0x03;
-                  memcpy(payloadBuffer.data() + 2, prodStr, len);
-                }
-              }
-            }
-          }
-
-          retSubmit.actualLength = htonl((int32_t)payloadBuffer.size());
-          send(clientSocket, (char *)&retSubmit, sizeof(USBIP_RET_SUBMIT), 0);
-          send(clientSocket, payloadBuffer.data(), (int)payloadBuffer.size(),
-               0);
-        } else {
-          retSubmit.actualLength = htonl(0);
-          send(clientSocket, (char *)&retSubmit, sizeof(USBIP_RET_SUBMIT), 0);
+        send(clientSocket, (char *)&retSubmit, sizeof(USBIP_RET_SUBMIT), 0);
+        if (direction == 1 && bytesTransferred > 0) {
+          send(clientSocket, dataBuffer.data(), (int)bytesTransferred, 0);
         }
       } else if (cmdType == 0x00000002) { // USBIP_CMD_UNLINK
-        struct CMD_UNLINK_TAIL {
-          uint32_t unlinkSeqnum;
-          uint8_t padding[24];
-        } unlinkTail;
-
-        if (!ReceiveExactBytes(clientSocket, (char *)&unlinkTail,
-                               sizeof(unlinkTail))) {
+        char unlinkTail[28];
+        if (!ReceiveExactBytes(clientSocket, unlinkTail, sizeof(unlinkTail)))
           break;
-        }
 
         USBIP_RET_UNLINK retUnlink = {0};
         retUnlink.base.command = htonl(0x00000004);
         retUnlink.base.seqnum = htonl(seqNum);
         retUnlink.status = htonl(0);
-
         send(clientSocket, (char *)&retUnlink, sizeof(USBIP_RET_UNLINK), 0);
       } else {
         break;
       }
     }
+
+    WinUsb_Free(hWinUsb);
+    CloseHandle(hDevice);
     closesocket(clientSocket);
   } else {
     closesocket(clientSocket);

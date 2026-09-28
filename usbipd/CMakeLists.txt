@@ -19,3 +19,10 @@ if(MSVC)
     target_compile_options(usbip_server PRIVATE /W4)
 endif()
 
+
+# Automatically copy winusb.inf to binary output folder (build/Debug)
+add_custom_command(TARGET usbip_server POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    "${CMAKE_CURRENT_SOURCE_DIR}/winusb.inf"
+    "$<TARGET_FILE_DIR:usbip_server>/winusb.inf"
+)
