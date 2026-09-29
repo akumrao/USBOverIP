@@ -2,76 +2,66 @@
 #include <iostream>
 #include <thread>
 
+HANDLE g_hVBoxDriver = INVALID_HANDLE_VALUE;
+
 int main() {
-  std::cout
-      << "====================================================================="
-      << std::endl;
-  std::cout << "     PRODUCTION-GRADE MULTI-THREADED USBIPD SERVER RUNTIME "
-               "ENGINE     "
-            << std::endl;
-  std::cout
-      << "====================================================================="
-      << std::endl;
+  std::cout << "========================================" << std::endl;
+  std::cout << "  usbipd-cpp v1.0" << std::endl;
+  std::cout << "========================================" << std::endl;
+
+  g_hVBoxDriver = OpenVBoxUsbDriver();
+  if (g_hVBoxDriver == INVALID_HANDLE_VALUE) {
+    std::cerr << "[-] Failed to open VBoxUSBMon" << std::endl;
+    return 1;
+  }
+  std::cout << "[+] VBoxUSBMon opened" << std::endl;
+
+
+  //DebugListAllUsbDevices();
+
+  //std::vector<USBIP_DEVICE_DESC> tes = ScanPhysicalUsbBus();
+
+
+
 
   WSADATA wsaData;
   if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
-    std::cerr << "[-] Critical Error: Winsock initialization failure."
-              << std::endl;
+    std::cerr << "[-] Winsock init failed" << std::endl;
     return 1;
   }
 
-  struct addrinfo networkHints, *addressResolveResult = nullptr;
-  ZeroMemory(&networkHints, sizeof(networkHints));
-  networkHints.ai_family = AF_INET;
-  networkHints.ai_socktype = SOCK_STREAM;
-  networkHints.ai_protocol = IPPROTO_TCP;
-  networkHints.ai_flags = AI_PASSIVE;
-
-  getaddrinfo(nullptr, USBIP_PORT, &networkHints, &addressResolveResult);
-  SOCKET masterListenSocket =
-      socket(addressResolveResult->ai_family, addressResolveResult->ai_socktype,
-             addressResolveResult->ai_protocol);
-
-  if (masterListenSocket == INVALID_SOCKET) {
-    std::cerr << "[-] Error assigning socket descriptor." << std::endl;
-    WSACleanup();
+  SOCKET listenSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+  if (listenSocket == INVALID_SOCKET) {
+    std::cerr << "[-] Socket creation failed" << std::endl;
     return 1;
   }
 
-  char optval = 1;
-  setsockopt(masterListenSocket, SOL_SOCKET, SO_REUSEADDR, &optval,
+  int optval = 1;
+  setsockopt(listenSocket, SOL_SOCKET, SO_REUSEADDR, (char *)&optval,
              sizeof(optval));
 
-  if (bind(masterListenSocket, addressResolveResult->ai_addr,
-           (int)addressResolveResult->ai_addrlen) == SOCKET_ERROR) {
-    std::cerr
-        << "[-] Bind conflict on Port 3240. Ensure you run as Administrator."
-        << std::endl;
-    closesocket(masterListenSocket);
-    freeaddrinfo(addressResolveResult);
-    WSACleanup();
+  sockaddr_in addr = {};
+  addr.sin_family = AF_INET;
+  addr.sin_addr.s_addr = INADDR_ANY;
+  addr.sin_port = htons(USBIP_PORT);
+
+  if (bind(listenSocket, (sockaddr *)&addr, sizeof(addr)) == SOCKET_ERROR) {
+    std::cerr << "[-] Bind failed. Error: " << WSAGetLastError() << std::endl;
     return 1;
   }
 
-  freeaddrinfo(addressResolveResult);
-  listen(masterListenSocket, SOMAXCONN);
-
-  std::cout << "[+] Server bound to Port " << USBIP_PORT << std::endl;
-  std::cout << "[+] Awaiting connection handshakes...\n" << std::endl;
+  listen(listenSocket, SOMAXCONN);
+  std::cout << "[+] Server listening on port " << USBIP_PORT << std::endl;
 
   while (true) {
-    SOCKET connectionAcceptHandle =
-        accept(masterListenSocket, nullptr, nullptr);
-    if (connectionAcceptHandle != INVALID_SOCKET) {
-      std::cout << "\n[+] Connection accepted! Dispatching worker thread..."
-                << std::endl;
-      std::thread processingWorker(ConnectionWorkerThread,
-                                   connectionAcceptHandle);
-      processingWorker.detach();
+    SOCKET clientSocket = accept(listenSocket, nullptr, nullptr);
+    if (clientSocket != INVALID_SOCKET) {
+      std::cout << "[+] Client connected" << std::endl;
+      std::thread(ConnectionWorkerThread, clientSocket).detach();
     }
   }
 
-  closesocket(masterListenSocket);
+  closesocket(listenSocket);
   WSACleanup();
   return 0;
 }
