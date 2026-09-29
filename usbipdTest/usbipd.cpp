@@ -296,10 +296,190 @@ bool IsDeviceAuthorizedInRegistry(const std::string &hardwareId) {
   return matchFound;
 }
 
+//std::vector<UsbDeviceInfo> ListUsbDevices() {
+//  std::vector<UsbDeviceInfo> devices;
+//
+//  // Use GUID_DEVCLASS_USB to only enumerate USB devices
+//  HDEVINFO hDevInfo =
+//      SetupDiGetClassDevsW(&GUID_DEVCLASS_USB, nullptr, nullptr, DIGCF_PRESENT);
+//  if (hDevInfo == INVALID_HANDLE_VALUE)
+//    return devices;
+//
+//  SP_DEVINFO_DATA devInfoData = {};
+//  devInfoData.cbSize = sizeof(SP_DEVINFO_DATA);
+//
+//  for (DWORD index = 0; SetupDiEnumDeviceInfo(hDevInfo, index, &devInfoData);
+//       ++index) {
+//    UsbDeviceInfo info = {};
+//
+//    wchar_t instanceId[MAX_DEVICE_ID_LEN];
+//    if (!SetupDiGetDeviceInstanceIdW(hDevInfo, &devInfoData, instanceId,
+//                                     MAX_DEVICE_ID_LEN, nullptr))
+//      continue;
+//
+//    std::wstring wsInstanceId(instanceId);
+//
+//    // Only process USB devices with VID/PID
+//    if (wsInstanceId.find(L"USB\\VID_") != 0)
+//      continue;
+//
+//    // Extract VID and PID using std::stoul (works correctly)
+//    size_t vidPos = wsInstanceId.find(L"VID_");
+//    size_t pidPos = wsInstanceId.find(L"PID_");
+//    if (vidPos == std::wstring::npos || pidPos == std::wstring::npos)
+//      continue;
+//
+//    std::wstring vidStr = wsInstanceId.substr(vidPos + 4, 4);
+//    std::wstring pidStr = wsInstanceId.substr(pidPos + 4, 4);
+//
+//    try {
+//      info.vid = (uint16_t)std::stoul(vidStr, nullptr, 16);
+//      info.pid = (uint16_t)std::stoul(pidStr, nullptr, 16);
+//    } catch (...) {
+//      continue;
+//    }
+//
+//    // Get friendly name
+//    wchar_t friendlyName[256] = {};
+//    DWORD nameSize = sizeof(friendlyName);
+//    if (SetupDiGetDeviceRegistryPropertyW(
+//            hDevInfo, &devInfoData, SPDRP_FRIENDLYNAME, NULL,
+//            (PBYTE)friendlyName, nameSize, &nameSize)) {
+//      char ansiName[256] = {};
+//      WideCharToMultiByte(CP_ACP, 0, friendlyName, -1, ansiName, 256, NULL,
+//                          NULL);
+//      info.description = ansiName;
+//    }
+//
+//    // Check if authorized for sharing
+//    std::string rawHardwareStr(wsInstanceId.begin(), wsInstanceId.end());
+//    bool isAuthorized = IsDeviceAuthorizedInRegistry(rawHardwareStr);
+//
+//    // Check if mass storage by class GUID
+//    GUID classGuid = {};
+//    DWORD guidSize = sizeof(classGuid);
+//    SetupDiGetDeviceRegistryPropertyW(hDevInfo, &devInfoData, SPDRP_CLASSGUID,
+//                                      NULL, (PBYTE)&classGuid, guidSize,
+//                                      &guidSize);
+//
+//    GUID GUID_DEVCLASS_USBSTOR = {
+//        0x4d36e967,
+//        0xe325,
+//        0x11ce,
+//        {0xbf, 0xc1, 0x08, 0x00, 0x2b, 0xe1, 0x03, 0x18}};
+//    info.isMassStorage = (classGuid == GUID_DEVCLASS_USBSTOR);
+//
+//    // Fallback: Check hardware ID for USBSTOR
+//    if (!info.isMassStorage) {
+//      wchar_t hardwareId[1024] = {};
+//      DWORD hwSize = sizeof(hardwareId);
+//      if (SetupDiGetDeviceRegistryPropertyW(
+//              hDevInfo, &devInfoData, SPDRP_HARDWAREID, NULL, (PBYTE)hardwareId,
+//              hwSize, &hwSize)) {
+//        std::wstring wsHwId(hardwareId);
+//        if (wsHwId.find(L"USBSTOR") != std::wstring::npos) {
+//          info.isMassStorage = true;
+//        }
+//      }
+//    }
+//
+//    // Generate busid
+//    size_t lastBackslash = wsInstanceId.find_last_of(L'\\');
+//    if (lastBackslash != std::wstring::npos) {
+//      std::wstring serial = wsInstanceId.substr(lastBackslash + 1);
+//      std::string busid;
+//      for (wchar_t c : serial) {
+//        if (isalnum(c))
+//          busid += static_cast<char>(c);
+//      }
+//      if (busid.length() > 8)
+//        busid = busid.substr(0, 8);
+//      info.busid = busid;
+//    }
+//
+//    std::cout << "[+] Found Device -> VID: " << std::hex << info.vid
+//              << " PID: " << info.pid;
+//    if (isAuthorized) {
+//      std::cout << " [AUTHORIZED FOR SHARE]";
+//    } else {
+//      std::cout << " [LOCAL ONLY]";
+//    }
+//    if (info.isMassStorage) {
+//      std::cout << " [MASS STORAGE]";
+//    }
+//    std::cout << std::dec << std::endl;
+//
+//    devices.push_back(info);
+//  }
+//
+//  SetupDiDestroyDeviceInfoList(hDevInfo);
+//  return devices;
+//}
+
+// Helper function to check if device is mass storage
+bool IsMassStorageDevice(HDEVINFO hDevInfo, SP_DEVINFO_DATA &devInfoData) {
+  // Method 1: Check device class code from registry (most reliable)
+  HKEY hKey = SetupDiOpenDevRegKey(hDevInfo, &devInfoData, DICS_FLAG_GLOBAL, 0,
+                                   DIREG_DEV, KEY_READ);
+  if (hKey != INVALID_HANDLE_VALUE) {
+    wchar_t classStr[256] = {};
+    DWORD classSize = sizeof(classStr);
+    if (RegQueryValueExW(hKey, L"Class", NULL, NULL, (LPBYTE)classStr,
+                         &classSize) == ERROR_SUCCESS) {
+      // Mass Storage class name is "USB" or check ClassGUID
+      if (wcscmp(classStr, L"USB") == 0) {
+        // Additional check: look for mass storage subclass
+        wchar_t classGuidStr[256] = {};
+        DWORD guidSize = sizeof(classGuidStr);
+        if (RegQueryValueExW(hKey, L"ClassGUID", NULL, NULL,
+                             (LPBYTE)classGuidStr,
+                             &guidSize) == ERROR_SUCCESS) {
+          // Mass Storage GUID: {4d36e967-e325-11ce-bfc1-08002be10318}
+          if (wcscmp(classGuidStr, L"{4d36e967-e325-11ce-bfc1-08002be10318}") ==
+              0) {
+            RegCloseKey(hKey);
+            return true;
+          }
+        }
+      }
+    }
+    RegCloseKey(hKey);
+  }
+
+  // Method 2: Check hardware ID for USBSTOR
+  wchar_t hardwareId[1024] = {};
+  DWORD hwSize = sizeof(hardwareId);
+  if (SetupDiGetDeviceRegistryPropertyW(hDevInfo, &devInfoData,
+                                        SPDRP_HARDWAREID, NULL,
+                                        (PBYTE)hardwareId, hwSize, &hwSize)) {
+    std::wstring wsHwId(hardwareId);
+    if (wsHwId.find(L"USBSTOR") != std::wstring::npos) {
+      return true;
+    }
+    // Also check for mass storage class in hardware ID
+    if (wsHwId.find(L"USB\\Class_08") != std::wstring::npos) {
+      return true;
+    }
+  }
+
+  // Method 3: Check compatible IDs
+  wchar_t compatibleIds[1024] = {};
+  DWORD compatSize = sizeof(compatibleIds);
+  if (SetupDiGetDeviceRegistryPropertyW(
+          hDevInfo, &devInfoData, SPDRP_COMPATIBLEIDS, NULL,
+          (PBYTE)compatibleIds, compatSize, &compatSize)) {
+    std::wstring wsCompat(compatibleIds);
+    if (wsCompat.find(L"USB\\Class_08") != std::wstring::npos) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
 std::vector<UsbDeviceInfo> ListUsbDevices() {
   std::vector<UsbDeviceInfo> devices;
 
-  // Use GUID_DEVCLASS_USB to only enumerate USB devices
   HDEVINFO hDevInfo =
       SetupDiGetClassDevsW(&GUID_DEVCLASS_USB, nullptr, nullptr, DIGCF_PRESENT);
   if (hDevInfo == INVALID_HANDLE_VALUE)
@@ -319,11 +499,9 @@ std::vector<UsbDeviceInfo> ListUsbDevices() {
 
     std::wstring wsInstanceId(instanceId);
 
-    // Only process USB devices with VID/PID
     if (wsInstanceId.find(L"USB\\VID_") != 0)
       continue;
 
-    // Extract VID and PID using std::stoul (works correctly)
     size_t vidPos = wsInstanceId.find(L"VID_");
     size_t pidPos = wsInstanceId.find(L"PID_");
     if (vidPos == std::wstring::npos || pidPos == std::wstring::npos)
@@ -355,33 +533,8 @@ std::vector<UsbDeviceInfo> ListUsbDevices() {
     std::string rawHardwareStr(wsInstanceId.begin(), wsInstanceId.end());
     bool isAuthorized = IsDeviceAuthorizedInRegistry(rawHardwareStr);
 
-    // Check if mass storage by class GUID
-    GUID classGuid = {};
-    DWORD guidSize = sizeof(classGuid);
-    SetupDiGetDeviceRegistryPropertyW(hDevInfo, &devInfoData, SPDRP_CLASSGUID,
-                                      NULL, (PBYTE)&classGuid, guidSize,
-                                      &guidSize);
-
-    GUID GUID_DEVCLASS_USBSTOR = {
-        0x4d36e967,
-        0xe325,
-        0x11ce,
-        {0xbf, 0xc1, 0x08, 0x00, 0x2b, 0xe1, 0x03, 0x18}};
-    info.isMassStorage = (classGuid == GUID_DEVCLASS_USBSTOR);
-
-    // Fallback: Check hardware ID for USBSTOR
-    if (!info.isMassStorage) {
-      wchar_t hardwareId[1024] = {};
-      DWORD hwSize = sizeof(hardwareId);
-      if (SetupDiGetDeviceRegistryPropertyW(
-              hDevInfo, &devInfoData, SPDRP_HARDWAREID, NULL, (PBYTE)hardwareId,
-              hwSize, &hwSize)) {
-        std::wstring wsHwId(hardwareId);
-        if (wsHwId.find(L"USBSTOR") != std::wstring::npos) {
-          info.isMassStorage = true;
-        }
-      }
-    }
+    // FIXED: Use the new mass storage detection function
+    info.isMassStorage = IsMassStorageDevice(hDevInfo, devInfoData);
 
     // Generate busid
     size_t lastBackslash = wsInstanceId.find_last_of(L'\\');
@@ -415,7 +568,6 @@ std::vector<UsbDeviceInfo> ListUsbDevices() {
   SetupDiDestroyDeviceInfoList(hDevInfo);
   return devices;
 }
-
 void PrintDeviceList(const std::vector<UsbDeviceInfo> &devices) {
   std::cout << "\n========================================" << std::endl;
   std::cout << "  USB Device List" << std::endl;
