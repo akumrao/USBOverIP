@@ -18,6 +18,16 @@ static const GUID GUID_CLASS_VBOXUSB = {
     0xEE80,
     {0xAA, 0x5E, 0x00, 0xC0, 0x4F, 0xB1, 0x72, 0x0B}};
 
+// Extended interface descriptor struct required by USB/IP specifications
+#pragma pack(push, 1)
+struct USBIP_USB_INTERFACE {
+  uint8_t bInterfaceClass;
+  uint8_t bInterfaceSubClass;
+  uint8_t bInterfaceProtocol;
+  uint8_t padding;
+};
+#pragma pack(pop)
+
 // ============================================================================
 // Helper Functions
 // ============================================================================
@@ -76,24 +86,26 @@ HANDLE OpenVBoxUsbDevice() {
   SP_DEVICE_INTERFACE_DATA devInterfaceData = {};
   devInterfaceData.cbSize = sizeof(SP_DEVICE_INTERFACE_DATA);
 
-  for (DWORD i = 0;; ++i) {
-    if (!SetupDiEnumDeviceInterfaces(hDevInfo, NULL, &GUID_CLASS_VBOXUSB, i,
-                                     &devInterfaceData)) {
-      if (GetLastError() == ERROR_NO_MORE_ITEMS)
-        break;
-      continue;
-    }
-
+  for (DWORD i = 0; SetupDiEnumDeviceInterfaces(
+           hDevInfo, NULL, &GUID_CLASS_VBOXUSB, i, &devInterfaceData);
+       ++i) {
     DWORD requiredSize = 0;
     SetupDiGetDeviceInterfaceDetailW(hDevInfo, &devInterfaceData, NULL, 0,
                                      &requiredSize, NULL);
-    if (GetLastError() != ERROR_INSUFFICIENT_BUFFER)
+
+    if (GetLastError() != ERROR_INSUFFICIENT_BUFFER || requiredSize == 0)
       continue;
 
     std::vector<BYTE> buffer(requiredSize);
     auto pDetail =
         reinterpret_cast<PSP_DEVICE_INTERFACE_DETAIL_DATA_W>(buffer.data());
-    pDetail->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W);
+
+    // Correct fixed cbSize value for SP_DEVICE_INTERFACE_DETAIL_DATA_W
+#if defined(_WIN64)
+    pDetail->cbSize = 8;
+#else
+    pDetail->cbSize = 6;
+#endif
 
     if (!SetupDiGetDeviceInterfaceDetailW(hDevInfo, &devInterfaceData, pDetail,
                                           requiredSize, &requiredSize, NULL)) {
@@ -101,9 +113,9 @@ HANDLE OpenVBoxUsbDevice() {
     }
 
     HANDLE hDevice =
-        CreateFileW(pDetail->DevicePath, FILE_READ_DATA | FILE_WRITE_DATA,
-                    FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
-                    FILE_FLAG_OVERLAPPED, NULL);
+        CreateFileW(pDetail->DevicePath, GENERIC_READ | GENERIC_WRITE,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
 
     if (hDevice != INVALID_HANDLE_VALUE) {
       SetupDiDestroyDeviceInfoList(hDevInfo);
@@ -115,146 +127,25 @@ HANDLE OpenVBoxUsbDevice() {
   return INVALID_HANDLE_VALUE;
 }
 
-// ============================================================================
-// USB Device Enumeration - DYNAMIC (no hardcoding)
-// ============================================================================
-
-// ============================================================================
-// USB Device Enumeration - DYNAMIC (using device class)
-// ============================================================================
-
-//// Find any USB Mass Storage Device (Device Class 0x08)
-//bool FindUsbMassStorageDevice(USBIP_DEVICE_DESC &desc) {
-//  // Use GUID for USB Mass Storage class
-//  // {4d36e967-e325-11ce-bfc1-08002be10318} is the USB class GUID
-//  // But we'll enumerate all USB devices and check their class
-//
-//  HDEVINFO hDevInfo = SetupDiGetClassDevsW(NULL, L"USB", NULL,
-//                                           DIGCF_PRESENT | DIGCF_ALLCLASSES);
-//  if (hDevInfo == INVALID_HANDLE_VALUE)
-//    return false;
-//
-//  SP_DEVINFO_DATA devInfo = {};
-//  devInfo.cbSize = sizeof(SP_DEVINFO_DATA);
-//
-//  for (DWORD i = 0; SetupDiEnumDeviceInfo(hDevInfo, i, &devInfo); ++i) {
-//    wchar_t instanceId[MAX_DEVICE_ID_LEN];
-//    if (!SetupDiGetDeviceInstanceIdW(hDevInfo, &devInfo, instanceId,
-//                                     MAX_DEVICE_ID_LEN, nullptr))
-//      continue;
-//
-//    std::wstring wsId(instanceId);
-//
-//    // Check if this is a USB device (starts with "USB\")
-//    if (wsId.find(L"USB\\") != 0 && wsId.find(L"USBSTOR\\") != 0)
-//      continue;
-//
-//    // Get device class
-//    DWORD deviceClass = 0;
-//    DWORD classSize = sizeof(deviceClass);
-//    SetupDiGetDeviceRegistryPropertyW(hDevInfo, &devInfo, SPDRP_CLASS, NULL,
-//                                      (PBYTE)&deviceClass, classSize,
-//                                      &classSize);
-//
-//    // Get device class GUID
-//    GUID classGuid = {};
-//    DWORD guidSize = sizeof(classGuid);
-//    SetupDiGetDeviceRegistryPropertyW(hDevInfo, &devInfo, SPDRP_CLASSGUID, NULL,
-//                                      (PBYTE)&classGuid, guidSize, &guidSize);
-//
-//    // Mass Storage class GUID: {4d36e967-e325-11ce-bfc1-08002be10318}
-//    // Or check by class code 0x08
-//    GUID GUID_DEVCLASS_USBSTOR = {
-//        0x4d36e967,
-//        0xe325,
-//        0x11ce,
-//        {0xbf, 0xc1, 0x08, 0x00, 0x2b, 0xe1, 0x03, 0x18}};
-//
-//    bool isMassStorage = (classGuid == GUID_DEVCLASS_USBSTOR);
-//
-//    // Also check by class code
-//    if (!isMassStorage) {
-//      // Get class code from registry
-//      HKEY hKey = SetupDiOpenDevRegKey(hDevInfo, &devInfo, DICS_FLAG_GLOBAL, 0,
-//                                       DIREG_DEV, KEY_READ);
-//      if (hKey != INVALID_HANDLE_VALUE) {
-//        DWORD classCode = 0;
-//        DWORD classCodeSize = sizeof(classCode);
-//        RegQueryValueExW(hKey, L"Class", NULL, NULL, (LPBYTE)&classCode,
-//                         &classCodeSize);
-//        RegCloseKey(hKey);
-//        // Class code 0x08 = Mass Storage
-//        isMassStorage = (classCode == 0x08);
-//      }
-//    }
-//
-//    if (!isMassStorage)
-//      continue;
-//
-//    // Extract VID and PID from instance ID
-//    // Format: USB\VID_0781&PID_558A&REV_0100 or
-//    // USBSTOR\DISK&VEN_SANDISK&PROD_...
-//    uint16_t vid = 0, pid = 0;
-//
-//    size_t vidPos = wsId.find(L"VID_");
-//    size_t pidPos = wsId.find(L"PID_");
-//
-//    if (vidPos != std::wstring::npos && pidPos != std::wstring::npos) {
-//      vid = static_cast<uint16_t>(
-//          std::stoi(wsId.substr(vidPos + 4, 4), nullptr, 16));
-//      pid = static_cast<uint16_t>(
-//          std::stoi(wsId.substr(pidPos + 4, 4), nullptr, 16));
-//    }
-//
-//    // Get device description
-//    wchar_t friendlyName[256] = {};
-//    DWORD nameSize = sizeof(friendlyName);
-//    SetupDiGetDeviceRegistryPropertyW(hDevInfo, &devInfo, SPDRP_FRIENDLYNAME,
-//                                      NULL, (PBYTE)friendlyName, nameSize,
-//                                      &nameSize);
-//
-//    memset(&desc, 0, sizeof(desc));
-//    strcpy_s(desc.busid, "1-5");
-//    strcpy_s(desc.path, "/sys/devices/platform/virtual_host_hub/usb1/1-5");
-//    desc.busnum = SWAP32(1);
-//    desc.devnum = SWAP32(5);
-//    desc.speed = SWAP32(3);
-//    desc.idVendor = SWAP16(vid);
-//    desc.idProduct = SWAP16(pid);
-//    desc.bcdDevice = SWAP16(0x0100);
-//    desc.bDeviceClass = 0x08; // Mass Storage
-//    desc.bNumConfigurations = 1;
-//    desc.bNumInterfaces = 1;
-//
-//    std::wcout << L"[+] Found USB Mass Storage: " << friendlyName << std::endl;
-//    std::cout << "    VID=" << std::hex << vid << " PID=" << pid << std::dec
-//              << std::endl;
-//
-//    SetupDiDestroyDeviceInfoList(hDevInfo);
-//    return true;
-//  }
-//
-//  SetupDiDestroyDeviceInfoList(hDevInfo);
-//  return false;
-//}
-
-
-// ============================================================================
-// USB Device Enumeration - SIMPLE APPROACH
-// ============================================================================
-
-// ============================================================================
-// USB Device Enumeration - FIXED for USB\VID_xxxx&PID_xxxx format
-// ============================================================================
+// Polling loop with incremental delays for PnP device interface enumeration
+HANDLE OpenVBoxUsbDeviceWithRetry(int maxRetries = 20, int delayMs = 500) {
+  for (int i = 0; i < maxRetries; ++i) {
+    HANDLE hDevice = OpenVBoxUsbDevice();
+    if (hDevice != INVALID_HANDLE_VALUE) {
+      return hDevice;
+    }
+    Sleep(delayMs);
+  }
+  return INVALID_HANDLE_VALUE;
+}
 
 // ============================================================================
 // Device Binding
 // ============================================================================
 
-bool BindDeviceToBusid(const char *busid) {
+bool BindDeviceToBusid(const char *busid, uint16_t vid, uint16_t pid) {
   std::cout << "[*] Binding device with busid: " << busid << std::endl;
 
-  // Check if device exists
   HDEVINFO hDevInfo = SetupDiGetClassDevsW(NULL, L"USB", NULL,
                                            DIGCF_PRESENT | DIGCF_ALLCLASSES);
   if (hDevInfo == INVALID_HANDLE_VALUE)
@@ -264,8 +155,8 @@ bool BindDeviceToBusid(const char *busid) {
   devInfo.cbSize = sizeof(SP_DEVINFO_DATA);
 
   wchar_t vidStr[16], pidStr[16];
-  swprintf_s(vidStr, L"VID_%04X", 0x0781);
-  swprintf_s(pidStr, L"PID_%04X", 0x5590);
+  swprintf_s(vidStr, L"VID_%04X", vid);
+  swprintf_s(pidStr, L"PID_%04X", pid);
 
   bool found = false;
   for (DWORD i = 0; SetupDiEnumDeviceInfo(hDevInfo, i, &devInfo); ++i) {
@@ -294,7 +185,7 @@ bool BindDeviceToBusid(const char *busid) {
 }
 
 // ============================================================================
-// Find USB Mass Storage Device (with bind fallback)
+// USB Device Enumeration
 // ============================================================================
 
 bool FindUsbMassStorageDevice(USBIP_DEVICE_DESC &desc) {
@@ -321,7 +212,7 @@ bool FindUsbMassStorageDevice(USBIP_DEVICE_DESC &desc) {
     if (wsId.find(L"VID_80EE") != std::wstring::npos)
       continue;
 
-    // Skip USB hubs and input devices (short instance IDs)
+    // Skip short instance IDs
     if (wsId.length() < 30)
       continue;
 
@@ -342,7 +233,7 @@ bool FindUsbMassStorageDevice(USBIP_DEVICE_DESC &desc) {
       continue;
     }
 
-    // Skip known hub/input VIDs
+    // Skip known root hubs / host controllers
     if (vid == 0x05E3 || vid == 0x8087 || vid == 0x1462 || vid == 0x413C)
       continue;
 
@@ -376,7 +267,7 @@ bool FindUsbMassStorageDevice(USBIP_DEVICE_DESC &desc) {
     if (!isMassStorage)
       continue;
 
-    // Found a mass storage device!
+    // Found mass storage device
     memset(&desc, 0, sizeof(desc));
     strcpy_s(desc.busid, "1-5");
     strcpy_s(desc.path, "/sys/devices/platform/virtual_host_hub/usb1/1-5");
@@ -400,13 +291,12 @@ bool FindUsbMassStorageDevice(USBIP_DEVICE_DESC &desc) {
 
   SetupDiDestroyDeviceInfoList(hDevInfo);
 
-  // FALLBACK: Bind to busid 1-5 and try again
+  // FALLBACK: Bind to busid 1-5 with target VID/PID and retry
   std::cout
       << "[!] No mass storage device found, attempting to bind busid 1-5..."
       << std::endl;
 
-  if (BindDeviceToBusid("1-5")) {
-    // Try again after binding
+  if (BindDeviceToBusid("1-5", 0x0781, 0x5590)) {
     hDevInfo = SetupDiGetClassDevsW(NULL, L"USB", NULL,
                                     DIGCF_PRESENT | DIGCF_ALLCLASSES);
     if (hDevInfo != INVALID_HANDLE_VALUE) {
@@ -420,7 +310,6 @@ bool FindUsbMassStorageDevice(USBIP_DEVICE_DESC &desc) {
 
         std::wstring wsId(instanceId);
 
-        // Look for the bound device (VID_0781&PID_5590)
         if (wsId.find(L"VID_0781") != std::wstring::npos &&
             wsId.find(L"PID_5590") != std::wstring::npos) {
 
@@ -439,7 +328,7 @@ bool FindUsbMassStorageDevice(USBIP_DEVICE_DESC &desc) {
           desc.bNumInterfaces = 1;
 
           std::cout << "[+] Found bound USB Mass Storage Device:" << std::endl;
-          std::cout << "    VID=781 PID=5590" << std::endl;
+          std::cout << "    VID=0781 PID=5590" << std::endl;
 
           SetupDiDestroyDeviceInfoList(hDevInfo);
           return true;
@@ -466,7 +355,7 @@ std::vector<USBIP_DEVICE_DESC> ScanPhysicalUsbBus() {
 }
 
 // ============================================================================
-// Device Capture via VBoxUSBMon - DYNAMIC
+// Device Capture via VBoxUSBMon Driver
 // ============================================================================
 
 bool CaptureDeviceWithVBox(HANDLE hVBox, uint16_t vid, uint16_t pid) {
@@ -559,63 +448,37 @@ void ConnectionWorkerThread(SOCKET clientSocket) {
             << std::endl;
 
   if (command == 0x8005) { // OP_REQ_DEVLIST
-  /*  std::cout << "[*] Handling OP_REQ_DEVLIST" << std::endl;
+    std::cout << "[*] Handling OP_REQ_DEVLIST" << std::endl;
     auto devices = ScanPhysicalUsbBus();
-    std::cout << "[*] Found " << devices.size() << " device(s)" << std::endl;
 
     USBIP_OP_REP_DEVLIST listReply = {};
     listReply.common.version = htons(0x0111);
     listReply.common.commandCode = htons(0x0005);
     listReply.common.status = 0;
-    listReply.numDevices = htonl((uint32_t)devices.size());
+    listReply.numDevices = htonl(static_cast<uint32_t>(devices.size()));
 
     send(clientSocket, (char *)&listReply, sizeof(listReply), 0);
+
     for (auto &dev : devices) {
       send(clientSocket, (char *)&dev, sizeof(dev), 0);
+
+      for (uint8_t i = 0; i < dev.bNumInterfaces; ++i) {
+        USBIP_USB_INTERFACE iface = {
+            dev.bDeviceClass == 0 ? static_cast<uint8_t>(0x08)
+                                  : dev.bDeviceClass,
+            dev.bDeviceSubClass, dev.bDeviceProtocol, 0x00};
+        send(clientSocket, (char *)&iface, sizeof(iface), 0);
+      }
     }
-    std::cout << "[+] Sent device list" << std::endl;*/
 
-         std::cout << "[*] Handling OP_REQ_DEVLIST" << std::endl;
-  auto devices = ScanPhysicalUsbBus();
-
-  USBIP_OP_REP_DEVLIST listReply = {};
-  listReply.common.version = htons(0x0111);
-  listReply.common.commandCode = htons(0x0005);
-  listReply.common.status = 0;
-  listReply.numDevices = htonl((uint32_t)devices.size());
-
-  send(clientSocket, (char *)&listReply, sizeof(listReply), 0);
-
-  for (auto &dev : devices) {
-    // Send device descriptor
-    send(clientSocket, (char *)&dev, sizeof(dev), 0);
-
-    // Send interface info (4 bytes per device)
-    uint8_t interfaceInfo[4] = {
-        0x08, // bInterfaceClass: Mass Storage
-        0x06, // bInterfaceSubClass: SCSI
-        0x50, // bInterfaceProtocol: Bulk-Only
-        0x00  // padding
-    };
-    send(clientSocket, (char *)interfaceInfo, sizeof(interfaceInfo), 0);
-  }
-
-  std::cout << "[+] Sent device list" << std::endl;
-
+    std::cout << "[+] Sent device list" << std::endl;
 
   } else if (command == 0x8003) { // OP_REQ_IMPORT
     std::cout << "[*] Handling OP_REQ_IMPORT" << std::endl;
 
-    char busid[32];
+    char busid[32] = {};
     if (!ReceiveExactBytes(clientSocket, busid, sizeof(busid))) {
       std::cerr << "[-] Failed to receive busid" << std::endl;
-      closesocket(clientSocket);
-      return;
-    }
-
-    // Ensure VBoxUSB driver is running
-    if (!EnsureVBoxUsbDriver()) {
-      std::cerr << "[-] VBoxUSB driver not available" << std::endl;
       closesocket(clientSocket);
       return;
     }
@@ -623,10 +486,10 @@ void ConnectionWorkerThread(SOCKET clientSocket) {
     std::string busidStr(busid);
     std::cout << "[*] Import request for busid: " << busidStr << std::endl;
 
-    // Check if device already exists
     auto it = g_devices.find(busidStr);
     if (it != g_devices.end() && it->second.hVBoxUsb != INVALID_HANDLE_VALUE) {
-      std::cout << "[*] Device already exists, returning cached" << std::endl;
+      std::cout << "[*] Device already exists, returning cached state"
+                << std::endl;
       USBIP_OP_REP_IMPORT importReply = {};
       importReply.common.version = htons(0x0111);
       importReply.common.commandCode = htons(0x0003);
@@ -636,7 +499,6 @@ void ConnectionWorkerThread(SOCKET clientSocket) {
       return;
     }
 
-    // Find any available USB Mass Storage Device dynamically
     std::cout << "[*] Searching for USB Mass Storage Device..." << std::endl;
     USBIP_DEVICE_DESC devInfo;
     if (!FindUsbMassStorageDevice(devInfo)) {
@@ -650,32 +512,31 @@ void ConnectionWorkerThread(SOCKET clientSocket) {
     std::cout << "[*] Found device: VID=" << std::hex << vid << " PID=" << pid
               << std::dec << std::endl;
 
-    // Capture device via VBoxUSBMon
+    // Start kernel driver first
+    if (!EnsureVBoxUsbDriver()) {
+      std::cerr << "[-] VBoxUSB driver not available" << std::endl;
+      closesocket(clientSocket);
+      return;
+    }
+
+    // Apply capture filter
     std::cout << "[*] Capturing device via VBoxUSBMon..." << std::endl;
     if (!CaptureDeviceWithVBox(g_hVBoxDriver, vid, pid)) {
-      std::cerr << "[-] Failed to capture device (CaptureDeviceWithVBox "
-                   "returned false)"
-                << std::endl;
+      std::cerr << "[-] Failed to capture device" << std::endl;
       closesocket(clientSocket);
       return;
     }
-    std::cout << "[+] Device captured via filter" << std::endl;
 
-    // Wait for device to be captured
-    std::cout << "[*] Waiting for VBoxUsb device to appear..." << std::endl;
-    Sleep(2000); // Give time for device to be captured
-
-    // Open VBoxUsb device
-    std::cout << "[*] Opening VBoxUsb device..." << std::endl;
-    HANDLE hVBoxUsb = OpenVBoxUsbDevice();
+    // Poll for VBoxUsb device interface
+    std::cout << "[*] Waiting for VBoxUsb device interface..." << std::endl;
+    HANDLE hVBoxUsb = OpenVBoxUsbDeviceWithRetry(20, 500);
     if (hVBoxUsb == INVALID_HANDLE_VALUE) {
-      std::cerr << "[-] Failed to open VBoxUsb device" << std::endl;
-      std::cerr << "    Make sure the device is bound: usbipd bind --busid 1-5"
+      std::cerr << "[-] Timed out waiting for VBoxUsb device interface"
                 << std::endl;
       closesocket(clientSocket);
       return;
     }
-    std::cout << "[+] VBoxUsb device opened" << std::endl;
+    std::cout << "[+] VBoxUsb device interface opened" << std::endl;
 
     // Claim device
     std::cout << "[*] Claiming device..." << std::endl;
@@ -689,7 +550,7 @@ void ConnectionWorkerThread(SOCKET clientSocket) {
       std::cout << "[+] Device claimed" << std::endl;
     }
 
-    // Store device state
+    // Store state
     DeviceState state = {};
     state.attached = true;
     state.claimed = true;
@@ -714,7 +575,7 @@ void ConnectionWorkerThread(SOCKET clientSocket) {
       std::cout << "[+] Import reply sent (" << sent << " bytes)" << std::endl;
     }
 
-    // Handle URB submissions
+    // URB Processing Loop
     std::cout << "[*] Entering URB handling loop..." << std::endl;
     while (true) {
       USBIP_HEADER_BASIC basicHeader;
@@ -736,9 +597,12 @@ void ConnectionWorkerThread(SOCKET clientSocket) {
       if (cmdType == 0x00000001) { // USBIP_CMD_SUBMIT
         USBIP_CMD_SUBMIT submit = {};
         memcpy(&submit.base, &basicHeader, sizeof(basicHeader));
-        if (!ReceiveExactBytes(clientSocket, (char *)&submit.transferFlags,
-                               sizeof(submit) - sizeof(basicHeader)))
+        if (!ReceiveExactBytes(clientSocket,
+                               reinterpret_cast<char *>(&submit) +
+                                   sizeof(basicHeader),
+                               sizeof(submit) - sizeof(basicHeader))) {
           break;
+        }
 
         int32_t reqLen = ntohl(submit.transferBufferLength);
         std::vector<char> dataBuffer(reqLen > 0 ? reqLen : 0);
@@ -748,13 +612,15 @@ void ConnectionWorkerThread(SOCKET clientSocket) {
             break;
         }
 
-        // Forward URB to VBoxUsb device
         UsbSupUrb urb = {};
-        urb.type = 2; // BULK
+        urb.type = (ep == 0) ? 1 : 2; // Control (1) vs Bulk (2)
         urb.ep = ep;
         urb.dir = direction;
         urb.len = reqLen;
-        urb.buf = reinterpret_cast<uint64_t>(dataBuffer.data());
+        urb.buf = dataBuffer.empty()
+                      ? 0
+                      : static_cast<uint64_t>(
+                            reinterpret_cast<uintptr_t>(dataBuffer.data()));
         urb.numIsoPkts = 0;
 
         int32_t actualLength = 0;
@@ -762,7 +628,6 @@ void ConnectionWorkerThread(SOCKET clientSocket) {
             SendUrbToDevice(hVBoxUsb, &urb, direction, dataBuffer.data(),
                             reqLen, &actualLength);
 
-        // Send response
         USBIP_RET_SUBMIT retSubmit = {};
         retSubmit.base.command = htonl(0x00000003);
         retSubmit.base.seqnum = htonl(seqNum);
@@ -793,7 +658,6 @@ void ConnectionWorkerThread(SOCKET clientSocket) {
       }
     }
 
-    // Cleanup
     auto cleanupIt = g_devices.find(busidStr);
     if (cleanupIt != g_devices.end()) {
       if (cleanupIt->second.hVBoxUsb != INVALID_HANDLE_VALUE) {
@@ -805,7 +669,6 @@ void ConnectionWorkerThread(SOCKET clientSocket) {
 
   closesocket(clientSocket);
 }
-
 
 void DebugListAllUsbDevices() {
   HDEVINFO hDevInfo = SetupDiGetClassDevsW(NULL, L"USB", NULL,
@@ -837,11 +700,6 @@ void DebugListAllUsbDevices() {
   SetupDiDestroyDeviceInfoList(hDevInfo);
   std::cout << "======================\n" << std::endl;
 }
-
-
-
-
-
 
 // ============================================================================
 // VBoxUSB Device Driver Management
@@ -879,7 +737,6 @@ bool StartVBoxUsbDriver() {
   SC_HANDLE hService =
       OpenServiceW(hSCM, L"VBoxUSB", SERVICE_START | SERVICE_QUERY_STATUS);
   if (!hService) {
-    // Try to create the service
     std::cout << "[*] VBoxUSB service not found, creating..." << std::endl;
 
     wchar_t exePath[MAX_PATH];
@@ -901,7 +758,6 @@ bool StartVBoxUsbDriver() {
     }
   }
 
-  // Start the service
   if (!StartServiceW(hService, 0, NULL)) {
     DWORD err = GetLastError();
     if (err != ERROR_SERVICE_ALREADY_RUNNING) {

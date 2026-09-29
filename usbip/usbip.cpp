@@ -1,4 +1,4 @@
-#define WIN32_LEAN_AND_MEAN
+#if 0
 
 #define WIN32_LEAN_AND_MEAN
 #include <iostream>
@@ -340,3 +340,83 @@ struct usbip_header {
     WSACleanup();
     return 0;
   }
+
+  #endif
+#include <iostream>
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#pragma comment(lib, "ws2_32.lib")
+
+#pragma pack(push, 1)
+struct USBIP_OP_COMMON {
+  uint16_t version;
+  uint16_t commandCode;
+  uint32_t status;
+};
+
+struct USBIP_OP_REP_IMPORT {
+  USBIP_OP_COMMON common;
+  struct {
+    char path[256];
+    char busid[32];
+    uint32_t busnum;
+    uint32_t devnum;
+    uint32_t speed;
+    uint16_t idVendor;
+    uint16_t idProduct;
+    uint16_t bcdDevice;
+    uint8_t bDeviceClass;
+    uint8_t bDeviceSubClass;
+    uint8_t bDeviceProtocol;
+    uint8_t bConfigurationValue;
+    uint8_t bNumConfigurations;
+    uint8_t bNumInterfaces;
+  } dev;
+};
+#pragma pack(pop)
+
+int main() {
+  WSADATA wsaData;
+  WSAStartup(MAKEWORD(2, 2), &wsaData);
+
+  SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+  sockaddr_in addr = {};
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons(3240);
+  inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+
+  std::cout << "[*] Connecting to server..." << std::endl;
+  if (connect(sock, (sockaddr *)&addr, sizeof(addr)) == SOCKET_ERROR) {
+    std::cerr << "[-] Failed to connect" << std::endl;
+    return 1;
+  }
+  std::cout << "[+] Connected to server" << std::endl;
+
+  // Send OP_REQ_IMPORT
+  USBIP_OP_COMMON req = {};
+  req.version = htons(0x0111);
+  req.commandCode = htons(0x8003);
+  send(sock, (char *)&req, sizeof(req), 0);
+
+  // Send busid
+  char busid[32] = "1-5";
+  send(sock, busid, sizeof(busid), 0);
+
+  // Receive import reply
+  USBIP_OP_REP_IMPORT rep = {};
+  recv(sock, (char *)&rep, sizeof(rep), 0);
+
+  std::cout << "[+] Device imported!" << std::endl;
+  std::cout << "    VID: 0x" << std::hex << ntohs(rep.dev.idVendor)
+            << std::endl;
+  std::cout << "    PID: 0x" << std::hex << ntohs(rep.dev.idProduct)
+            << std::endl;
+
+  std::cout << "\n[+] VBoxUSB device should now be available!" << std::endl;
+  std::cout << "Press Enter to disconnect..." << std::endl;
+  std::cin.get();
+
+  closesocket(sock);
+  WSACleanup();
+  return 0;
+}
